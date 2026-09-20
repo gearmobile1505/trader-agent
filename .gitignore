@@ -1,0 +1,83 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+env/
+
+# Environment
+.env
+.env.*
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# CSV data files
+*.csv
+*.jsonl
+*.json
+
+# Logs
+*.log
+logs/
+
+# Data (large files)
+data/*.csv
+data/*.jsonl
+
+# Terraform state
+terraform/**/.terraform/
+terraform/**/terraform.tfstate
+terraform/**/terraform.tfstate.backup
+terraform/**/*.tfvars
+terraform/**/*.tfvars.*
+
+# Source (local dev build artifacts)
+source/
+
+# Docker
+Dockerfile*
+docker-compose*
+
+# Test
+tests/
+test_*
+
+# macOS
+.VolumeIcon.icns
+.ClusterFirst
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+.DocumentRevisions-V100
+.fseventsd
+.Spotlight-V100
+.Trashes
+.TemporaryItems
+.Versions
+
+# Visual Studio Code
+.vscode/*
+!.vscode/settings.json
+!.vscode/extensions.json
+
+# Virtual environment
+*.egg-link
+.pytest_cache/
+.mypy_cache/
+
+# Backup files
+*.bak
+*.backup

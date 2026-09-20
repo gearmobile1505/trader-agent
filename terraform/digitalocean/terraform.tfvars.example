@@ -1,0 +1,21 @@
+# DigitalOcean Terraform Variables
+# Copy this file to terraform.tfvars and fill in your values
+
+do_token           = "your_digitalocean_pat_here"
+ssh_fingerprint    = "your_ssh_key_fingerprint_here"
+project_name       = "trader-agent"
+environment        = "prod"
+region             = "nyc3"
+droplet_size       = "s-2vcpu-4gb"
+domain_name        = ""  # e.g., "yourdomain.com" (optional)
+
+# TradeLocker credentials
+tradelocker_email    = "your_email@example.com"
+tradelocker_password = "your_password_here"
+tradelocker_server   = "GATESFX"
+
+# Trading parameters
+ollama_model              = "llama3"
+risk_per_trade            = 200
+daily_loss_limit          = 400
+max_concurrent_positions  = 3
