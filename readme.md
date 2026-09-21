@@ -1,6 +1,6 @@
 # Phantom Flow — 5M Scalping Bot
 
-AI-powered CFD trading webhook bridge. TradingView signals → AI review (Ollama/llama3) → TradeLocker execution.
+AI-powered CFD trading webhook bridge. TradingView signals → AI review (Ollama/phi3:mini) → TradeLocker execution.
 
 ## Quick Start
 
@@ -26,7 +26,7 @@ For temporary testing only, expose port 8000 with localtunnel or ngrok and updat
 ### Production architecture
 ```text
 TradingView → Cloudflare DNS/proxy → Nginx :443 → FastAPI :8000 (localhost)
-                                                    ├→ Ollama / llama3
+                                                     ├→ Ollama / phi3:mini
                                                     └→ TradeLocker
 ```
 
@@ -70,7 +70,7 @@ cd terraform/digitalocean
 cp terraform.tfvars.example terraform.tfvars
 ```
 
-Set these values in `terraform.tfvars`: `do_token`, `ssh_fingerprint`, your current public IP in `ssh_ip`, `domain_name`, and the TradeLocker variables. Use a droplet with at least 4 GB RAM when running Ollama locally.
+Set these values in `terraform.tfvars`: `do_token`, `ssh_fingerprint`, your current public IP in `ssh_ip`, `domain_name`, and the TradeLocker variables. Use a droplet with at least 4 GB RAM (8 GB recommended with swap) when running Ollama locally.
 
 ```bash
 terraform init
@@ -147,7 +147,7 @@ TL_ENV=https://demo.tradelocker.com
 TL_USER=your_trade_locker_email
 TL_PASS=your_trade_locker_password
 TL_SERVER=GATESFX
-OLLAMA_MODEL=llama3
+OLLAMA_MODEL=phi3:mini
 ```
 
 The Terraform bootstrap currently writes `TRADELOCKER_EMAIL`, `TRADELOCKER_PASSWORD`, and `TRADELOCKER_SERVER`; those names do not match the app. Correct the file as above before enabling `trader-agent`. Do not paste real credentials into shell history.
@@ -374,7 +374,7 @@ Test every update with the local status endpoint before re-enabling TradingView 
 - **Technical Summary** — Live computation: EMA(9/21), SMA(50), RSI(14), MACD, ADX, Williams %R → rating fed to AI as directional bias
 - **Phantom Shift Strategy** — ATR(10) × 3.0 dynamic stop loss
 - **Trailing Stop** — $75 trigger, $50 trail distance on profitable positions
-- **AI Risk Assessment** — Ollama llama3 reviews every trade (approve/reject)
+- **AI Risk Assessment** — Ollama phi3:mini reviews every trade (approve/reject)
 - **Position Sizing** — $125 risk per trade, dynamic: `qty = $125 / (SL_distance × point_value)`, capped by max_lot
 - **Session Trading** — ASIA, EU, NY_EARLY, NY sessions
 
@@ -428,7 +428,7 @@ alerts_log.jsonl           # Trade log (all decisions logged)
 
 | Issue | Fix |
 |-------|-----|
-| "Outside trading session" | Check ET time matches symbol sessions |
+| "Outside trading session" | Check ET time matches symbol sessions (ASIA/EU active on weekends; NY/NY_EARLY blocked) |
 | "Symbol not approved" | Use exact chart symbol from mapping |
 | AI timeout | Verify `ollama serve` is running |
 | Broker error | Check `.env` credentials, TradeLocker demo status |
