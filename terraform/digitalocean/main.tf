@@ -14,7 +14,7 @@ provider "digitalocean" {
 
 resource "digitalocean_droplet" "trading_bot" {
   image              = "ubuntu-24-04-x64"
-  name               = "${var.project_name}-${var.environment}"
+  name               = "${var.project_name}-${var.environment}-2"
   region             = var.region
   size               = var.droplet_size
   ssh_keys           = [var.ssh_fingerprint]
@@ -33,12 +33,16 @@ resource "digitalocean_droplet" "trading_bot" {
 
   lifecycle {
     create_before_destroy = true
+    ignore_changes = [
+      ssh_keys,
+      user_data,
+    ]
   }
   
 }
 
 resource "digitalocean_firewall" "trading_firewall" {
-  name = "${var.project_name}-firewall"
+  name = "${var.project_name}-firewall-v2"
 
   droplet_ids = [digitalocean_droplet.trading_bot.id]
 
@@ -57,6 +61,12 @@ resource "digitalocean_firewall" "trading_firewall" {
   outbound_rule {
     protocol              = "tcp"
     port_range            = "443"
+    destination_addresses = ["0.0.0.0/0", "::/0"]
+  }
+
+  outbound_rule {
+    protocol              = "udp"
+    port_range            = "7844"
     destination_addresses = ["0.0.0.0/0", "::/0"]
   }
 

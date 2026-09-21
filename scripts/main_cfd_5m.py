@@ -8,6 +8,8 @@ Top symbols: LVMH, XPDUSD.R, ALPHABET-C, UKOIL.R, SIEMENS, GE
 import os
 import json
 import gzip
+import asyncio
+from uuid import uuid4
 from datetime import datetime, timedelta
 from fastapi import FastAPI, Request
 import ollama
@@ -658,9 +660,25 @@ async def start_trailing_stop_monitor():
 @app.post("/webhook")
 async def receive_tradingview_alert(request: Request):
     data = await request.json()
+
+    task_id = uuid4().hex
+    print(f"Webhook accepted for background processing: {task_id}", flush=True)
+    task = asyncio.create_task(asyncio.to_thread(process_tradingview_alert, data, task_id))
+    task.add_done_callback(report_background_task_failure)
+    return {"status": "accepted", "task_id": task_id}
+
+def report_background_task_failure(task):
+    """Surface unexpected background failures in the service journal."""
+    try:
+        task.result()
+    except Exception as error:
+        print(f"[BACKGROUND WEBHOOK ERROR] {error}", flush=True)
+
+def process_tradingview_alert(data: dict, task_id: str):
+    """Run the blocking broker and AI workflow outside the Uvicorn event loop."""
     
     # Log full raw payload for debugging
-    print(f"Raw webhook payload: {json.dumps(data)}")
+    print(f"Raw webhook payload ({task_id}): {json.dumps(data)}", flush=True)
     
     action = data.get("action")  # "buy" or "sell"
     tv_ticker = data.get("ticker")
