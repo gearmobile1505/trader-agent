@@ -1039,6 +1039,8 @@ async def get_status():
         "risk_per_trade": TARGET_DOLLAR_RISK,
         "max_daily_loss": MAX_DAILY_LOSS,
         "max_open_trades": MAX_OPEN_TRADES,
+        "max_hold_time_minutes": MAX_HOLD_TIME_MINUTES,
+        "max_sl_overshoot_pct": MAX_SL_OVERSHOOT_PCT,
         "shift_params": {"atr_period": SHIFT_ATR_PERIOD, "multiplier": SHIFT_MULTIPLIER},
         "sessions_et": SESSIONS_ET
     }
