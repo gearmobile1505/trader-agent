@@ -424,6 +424,61 @@ terraform/digitalocean/    # Infrastructure as Code
 alerts_log.jsonl           # Trade log (all decisions logged)
 ```
 
+## Sharing Setup (Onboarding a New User)
+
+This project can be replicated by a friend on their own infrastructure. The strategy code (PineScript + Python) is universal; only credentials and account-specific configuration need to change.
+
+### What Must Be Swapped Out
+
+| Item | Current (yours) | Friend needs |
+|------|-----------------|--------------|
+| DO API token | `dop_v1_...` in terraform.tfvars | Their own DO account + token |
+| SSH key | Your ed25519 key | Their own SSH key |
+| TradeLocker email | `gearmobile1505@gmail.com` | Their TL account email |
+| TradeLocker password | `ve8bb0!S` | Their TL account password |
+| TradeLocker server | `GATESFX` | Their TL server (same firm or different) |
+| TradeLocker account | `2458648` | Their TL account number |
+| Cloudflare tunnel | `division-sequences-million-importance.trycloudflare.com` | Auto-generated on their server |
+| GitHub repo | `gearmobile1505/trader-agent` | Their own repo or fork |
+| `.env` file | Contains your credentials | Must be recreated with theirs |
+| alerts_log.jsonl | Your trade history | Clear before starting |
+| SSH authorized_keys | Your public key | Rotate to their key |
+
+### What Stays the Same
+
+- **PineScript** (`phantom.pine`) - same indicator, same signal logic
+- **Python code** (`main_cfd_5m.py`) - same strategy, risk params, ATR config, symbol mappings
+- **Ollama model** `phi3:mini` (2.2GB) - same model
+- **Risk parameters**: $125 risk/trade, max 3 concurrent, $500 daily loss limit
+- **Session configs**: ASIA, EU, NY, NY_EARLY, NY_MORNING definitions
+- **TP config**: Per-symbol TP levels from swing analysis P70 percentiles
+
+### Minimum Server Specs
+
+- **Droplet**: s-2vcpu-4gb ($24/mo minimum)
+- **RAM**: 4GB (phi3:mini model = 2.2GB + service ~1.5GB)
+- **Disk**: 50GB minimum
+- **Region**: nyc3 recommended (same as current)
+
+### Setup Sequence for New User
+
+1. Create DO account → create droplet with user_data.sh (update GitHub clone URL to their repo)
+2. Set up TradeLocker `.env` with their credentials
+3. Start Ollama, pull `phi3:mini`
+4. Start cloudflared → get tunnel URL
+5. Start trader-agent service
+6. Set up TradingView alert with their tunnel webhook URL
+7. Test webhook returns immediately with `task_id`
+
+### Critical Gotchas
+
+- **Snapshot contains your .env** - must overwrite with friend's credentials before first trade
+- **Snapshot contains your .git history** - user_data.sh has hardcoded clone URL, must update
+- **Snapshot contains your alerts_log.jsonl** - may cause confusion, clear it
+- **Snapshot contains your cloudflared state** - tunnel URL won't work for friend
+- **Snapshot contains your SSH key in authorized_keys** - rotate SSH keys after setup
+- **TradingView alert must use friend's tunnel URL** - not yours
+
 ## Troubleshooting
 
 | Issue | Fix |
