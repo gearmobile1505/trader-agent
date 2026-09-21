@@ -231,6 +231,52 @@ curl -fsS http://127.0.0.1:8000/status
 
 The repository contains the application code; `.env`, `venv`, logs, and the server-created `health_check.sh` remain outside the committed source. Roll back by checking out the last known-good commit as `trader` and restarting the service. Review daily loss and open-position limits after every configuration change.
 
+### Webhook and trade outcome logging
+
+The webhook response status and the trade result are different signals. An HTTP `200 OK` means FastAPI received and processed the request; it does not prove that TradeLocker accepted an order. The application records the decision and broker response in:
+
+```text
+/opt/trader-agent/scripts/alerts_log.jsonl
+
+cat /opt/trader-agent-manual-20260920-182815/scripts/alerts_log.jsonl
+
+ grep -n "UKOIL" /opt/trader-agent/scripts/alerts_log.jsonl
+```
+
+On a new Git deployment, create and permission the log file before testing:
+```bash
+sudo -u trader mkdir -p /opt/trader-agent/scripts
+sudo -u trader touch /opt/trader-agent/scripts/alerts_log.jsonl
+sudo chmod 600 /opt/trader-agent/scripts/alerts_log.jsonl
+```
+
+Monitor both request receipt and application outcomes:
+```bash
+sudo journalctl -u trader-agent -f
+sudo -u trader tail -f /opt/trader-agent/scripts/alerts_log.jsonl
+```
+
+Useful checks:
+```bash
+# Count webhook requests received by FastAPI in the last 24 hours
+sudo journalctl -u trader-agent --since '24 hours ago' --no-pager \
+  | grep -c 'POST /webhook'
+
+# Summarize recorded decisions without printing full payloads
+sudo -u trader python -c '
+import json
+from pathlib import Path
+path = Path("/opt/trader-agent/scripts/alerts_log.jsonl")
+for line in path.read_text().splitlines():
+    item = json.loads(line)
+    alert = item.get("alert", {})
+    result = item.get("result", {})
+    print(item.get("timestamp"), alert.get("ticker"), alert.get("action"), result.get("status"))
+'
+```
+
+The previous manually deployed instance recorded four `GBPJPY.R` BUY webhooks on 2026-09-20 at 14:45:19, 15:06:27, 15:43:05, and 15:45:13 UTC. All four returned HTTP `200 OK` but were recorded as `rejected`; no TradeLocker execution was indicated. Those historical records remain in the migration backup at `/opt/trader-agent-manual-*/scripts/alerts_log.jsonl`.
+
 ### Security warning: TradeLocker debug logging
 
 The current TradeLocker client configuration has emitted authentication request data at debug level into `journalctl`. Before any live-capital use:
@@ -299,6 +345,8 @@ Test every update with the local status endpoint before re-enabling TradingView 
 - [ ] `cloudflared` is active and its hostname resolves through Cloudflare.
 - [ ] `/status` and `/symbols` respond through the public HTTPS hostname.
 - [ ] A harmless webhook reaches the service and is visible in `journalctl`.
+- [ ] `alerts_log.jsonl` exists, is writable by `trader`, and records the webhook result.
+- [ ] HTTP `200 OK` is not being treated as proof of broker execution.
 - [ ] The intended TradeLocker demo account is connected and test orders are understood.
 - [ ] `.env`, Terraform variables, SSH keys, and Terraform state are not tracked by Git.
 - [ ] Any credential that was previously exposed in a file or shell history has been rotated.
