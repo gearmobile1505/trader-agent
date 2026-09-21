@@ -25,8 +25,9 @@ app = FastAPI()
 ALERT_LOG = "/opt/trader-agent/scripts/alerts_log.jsonl"
 
 # Trailing Stop Configuration
-TRAILING_TRIGGER_PROFIT = 75.0     # Trigger trailing stop when unrealized P&L >= $75 (0.375R)
-TRAILING_DISTANCE_DOLLARS = 50.0   # Trail distance in dollars (0.25R)
+TRAILING_TRIGGER_PROFIT = 50.0    # Trigger trailing stop when unrealized P&L >= $50
+TRAILING_SL_BE_PROFIT = 100.0     # Move SL to breakeven when P&L >= $100, then trail from BE
+TRAILING_DISTANCE_DOLLARS = 50.0  # Trail distance in dollars (0.25R)
 TRAILING_CHECK_INTERVAL = 30       # Check positions every 30 seconds
 
 # Gzip decompression + JSON fix middleware
@@ -235,18 +236,18 @@ MIN_RISK_REWARD = 1.5             # Min R:R for entry
 # TP1 = $200 for indices (wide spreads eat profits on tight TPs), $300 for others
 # TP2 = Swing P70 target for symbols with R:R > 2.0, else trail only
 TP_CONFIG = {
-    "US30.R":     {"tp1_dollars": 200, "tp2_dollars": None, "trail_after_tp1": True},   # Trail only (huge swings)
-    "NAS100.R":   {"tp1_dollars": 200, "tp2_dollars": None, "trail_after_tp1": True},   # Trail only (huge swings)
-    "SPX500.R":   {"tp1_dollars": 200, "tp2_dollars": 950, "trail_after_tp1": False},  # P70 ~$950
-    "XAUUSD.R":   {"tp1_dollars": 300, "tp2_dollars": 1000, "trail_after_tp1": False}, # P70 ~$1000
-    "XPDUSD.R":   {"tp1_dollars": 300, "tp2_dollars": 500, "trail_after_tp1": False},  # P70 ~$500
-    "UKOIL.R":    {"tp1_dollars": 300, "tp2_dollars": 400, "trail_after_tp1": False},  # P70 ~$400
-    "LVMH":       {"tp1_dollars": 300, "tp2_dollars": None, "trail_after_tp1": True},   # Low swings, trail only
-    "SIEMENS":    {"tp1_dollars": 300, "tp2_dollars": None, "trail_after_tp1": True},   # Low swings, trail only
-    "ALPHABET-C": {"tp1_dollars": 300, "tp2_dollars": None, "trail_after_tp1": True},   # Low swings, trail only
-    "GE":         {"tp1_dollars": 300, "tp2_dollars": None, "trail_after_tp1": True},   # Low swings, trail only
-    "GBPJPY.R":   {"tp1_dollars": 300, "tp2_dollars": None, "trail_after_tp1": True},   # JPY pair, trail only
-    "USDJPY.R":   {"tp1_dollars": 300, "tp2_dollars": None, "trail_after_tp1": True},   # JPY pair, trail only
+    "US30.R":     {"tp1_dollars": 200, "tp2_dollars": None, "trail_after_tp1": True},
+    "NAS100.R":   {"tp1_dollars": 200, "tp2_dollars": None, "trail_after_tp1": True},
+    "SPX500.R":   {"tp1_dollars": 200, "tp2_dollars": None, "trail_after_tp1": False},
+    "XAUUSD.R":   {"tp1_dollars": 200, "tp2_dollars": None, "trail_after_tp1": False},
+    "XPDUSD.R":   {"tp1_dollars": 200, "tp2_dollars": None, "trail_after_tp1": False},
+    "UKOIL.R":    {"tp1_dollars": 200, "tp2_dollars": None, "trail_after_tp1": False},
+    "LVMH":       {"tp1_dollars": 200, "tp2_dollars": None, "trail_after_tp1": True},
+    "SIEMENS":    {"tp1_dollars": 200, "tp2_dollars": None, "trail_after_tp1": True},
+    "ALPHABET-C": {"tp1_dollars": 200, "tp2_dollars": None, "trail_after_tp1": True},
+    "GE":         {"tp1_dollars": 200, "tp2_dollars": None, "trail_after_tp1": True},
+    "GBPJPY.R":   {"tp1_dollars": 200, "tp2_dollars": None, "trail_after_tp1": True},
+    "USDJPY.R":   {"tp1_dollars": 200, "tp2_dollars": None, "trail_after_tp1": True},
 }
 
 # Session time ranges (ET)
@@ -595,20 +596,32 @@ async def check_and_apply_trailing_stops():
             qty = float(pos.get("qty", 0.0))
             side = pos.get("side", "")
             avg_price = float(pos.get("avgPrice", 0.0))
+            instrument_id = int(pos.get("tradableInstrumentId", 0))
             
-            # Skip if already has trailing stop
-            if position_id in _trailing_active_positions:
+            # Phase 2: P&L >= $100 → move SL to BE then trail
+            if unrealized_pl >= TRAILING_SL_BE_PROFIT:
+                try:
+                    modification_params = {
+                        "stopLossType": "absolute",
+                        "stopLoss": avg_price
+                    }
+                    success = tl.modify_position(position_id, modification_params)
+                    if success:
+                        _trailing_active_positions.discard(position_id)
+                        print(f"[TRAILING BE] Position {position_id}: SL moved to BE @{avg_price}, P&L=${unrealized_pl:.2f}")
+                        # Re-apply trailing from BE in next check cycle
+                    else:
+                        print(f"[TRAILING BE] Failed to move SL to BE for position {position_id}")
+                except Exception as e:
+                    print(f"[TRAILING BE] Error for position {position_id}: {e}")
                 continue
             
-            # Check if profit threshold reached
+            # Phase 1: P&L >= $50 → apply trailing stop
             if unrealized_pl >= TRAILING_TRIGGER_PROFIT:
+                if position_id in _trailing_active_positions:
+                    continue
+                
                 try:
-                    # Convert trailing distance from dollars to price distance
-                    # For position: trailing_distance_price = TRAILING_DISTANCE_DOLLARS / (qty * point_value)
-                    # Need to find symbol from position
-                    instrument_id = int(pos.get("tradableInstrumentId", 0))
-                    
-                    # Get symbol config for point_value
                     symbol_config = None
                     for sym, cfg in TOP_SYMBOLS.items():
                         if tl.get_instrument_id_from_symbol_name(sym) == instrument_id:
@@ -618,14 +631,12 @@ async def check_and_apply_trailing_stops():
                     if symbol_config is None:
                         continue
                     
-                    point_value = get_point_value(tl_symbol)
+                    point_value = get_point_value(sym)
                     trail_distance_price = TRAILING_DISTANCE_DOLLARS / (abs(qty) * point_value)
                     
-                    # Round to tick size
                     tick_size = symbol_config.get("tick_size", 0.01)
                     trail_distance_price = round(trail_distance_price / tick_size) * tick_size
                     
-                    # Apply trailing stop via modify_position
                     modification_params = {
                         "stopLossType": "trailingOffset",
                         "stopLoss": trail_distance_price
@@ -634,9 +645,9 @@ async def check_and_apply_trailing_stops():
                     success = tl.modify_position(position_id, modification_params)
                     if success:
                         _trailing_active_positions.add(position_id)
-                        print(f"[TRAILING STOP] Applied to position {position_id}: trail_distance=${TRAILING_DISTANCE_DOLLARS} ({trail_distance_price:.5f} price), P&L=${unrealized_pl:.2f}")
+                        print(f"[TRAILING STOP] Applied to position {position_id}: trail=${TRAILING_DISTANCE_DOLLARS} ({trail_distance_price:.5f}), P&L=${unrealized_pl:.2f}")
                     else:
-                        print(f"[TRAILING STOP] Failed to apply to position {position_id}")
+                        print(f"[TRAILING STOP] Failed for position {position_id}")
                         
                 except Exception as e:
                     print(f"[TRAILING STOP] Error for position {position_id}: {e}")
@@ -656,7 +667,7 @@ async def start_trailing_stop_monitor():
             await check_and_apply_trailing_stops()
     
     asyncio.create_task(trailing_loop())
-    print(f"[TRAILING STOP] Monitor started: trigger=${TRAILING_TRIGGER_PROFIT}, trail_distance=${TRAILING_DISTANCE_DOLLARS}, interval={TRAILING_CHECK_INTERVAL}s")
+    print(f"[TRAILING STOP] Monitor started: trigger=${TRAILING_TRIGGER_PROFIT}→BE=${TRAILING_SL_BE_PROFIT}, trail=${TRAILING_DISTANCE_DOLLARS}, interval={TRAILING_CHECK_INTERVAL}s")
 
 @app.post("/webhook")
 async def receive_tradingview_alert(request: Request):
