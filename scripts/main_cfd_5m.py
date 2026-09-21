@@ -230,6 +230,8 @@ TARGET_DOLLAR_RISK = 125.0        # $125 risk per trade
 MAX_DAILY_LOSS = 400.0            # Stop trading if -$400/day
 MAX_OPEN_TRADES = 3               # Max concurrent positions
 MIN_RISK_REWARD = 1.5             # Min R:R for entry
+MAX_HOLD_TIME_MINUTES = 45        # Max time a trade can be open (5m scalping)
+MAX_SL_OVERSHOOT_PCT = 20         # Max % over $125 risk at SL (min lot basis): 150 = reject
 
 # Take Profit Configuration (based on swing analysis P70 percentiles)
 # Format: {symbol: {tp1_dollars, tp2_dollars, use_trail_after_tp1}}
@@ -307,20 +309,7 @@ def map_symbol(tv_symbol: str) -> str:
 def get_point_value(tl_symbol: str) -> float:
     """Get the USD value of a one-price-unit move for one lot."""
     symbol_config = TOP_SYMBOLS.get(tl_symbol, {})
-    if tl_symbol not in {"GBPJPY.R", "USDJPY.R"}:
-        return symbol_config.get("point_value", 1.0)
-
-    # JPY-quoted FX P&L must be converted to USD using the live USDJPY rate.
-    # One full price unit is 100,000 JPY for a standard lot.
-    try:
-        usd_jpy_id = tl.get_instrument_id_from_symbol_name("USDJPY.R")
-        usd_jpy_price = tl.get_latest_bid_price(usd_jpy_id)
-        if usd_jpy_price > 0:
-            return 100000.0 / usd_jpy_price
-    except Exception as exc:
-        print(f"[POINT VALUE] Could not fetch USDJPY conversion: {exc}", flush=True)
-
-    return 650.0
+    return symbol_config.get("point_value", 1.0)
 
 def get_min_lot(tl_symbol: str) -> float:
     return TOP_SYMBOLS.get(tl_symbol, {}).get("min_lot", 0.01)
@@ -364,7 +353,34 @@ def validate_entry(tl_symbol: str, action: str, entry: float, sl: float) -> tupl
     sl_dist = abs(entry - sl)
     if sl_dist <= 0:
         return False, "Invalid stop loss"
-    
+
+    return True, "OK"
+
+
+def validate_sl_distance(tl_symbol: str, action: str, entry: float, sl: float) -> tuple[bool, str]:
+    """Validate that even at minimum lot, SL risk doesn't exceed MAX_SL_OVERSHOOT_PCT % of TARGET_DOLLAR_RISK.
+
+    This prevents trades where the SL is so wide that min lot exposure still breaches the risk limit.
+    """
+    if tl_symbol not in TOP_SYMBOLS:
+        return False, f"Symbol {tl_symbol} not in approved list"
+
+    sl_dist = abs(entry - sl)
+    if sl_dist <= 0:
+        return False, "Invalid stop loss"
+
+    min_lot = get_min_lot(tl_symbol)
+    point_val = get_point_value(tl_symbol)
+    min_lot_risk = sl_dist * min_lot * point_val
+    max_acceptable_risk = TARGET_DOLLAR_RISK * (1 + MAX_SL_OVERSHOOT_PCT / 100)
+
+    if min_lot_risk > max_acceptable_risk:
+        max_sl_dist = max_acceptable_risk / (min_lot * point_val)
+        return False, (
+            f"SL distance {sl_dist:.2f} too wide: min lot risk=${min_lot_risk:.2f} "
+            f"exceeds ${max_acceptable_risk:.2f}. Max SL distance={max_sl_dist:.2f} pts"
+        )
+
     return True, "OK"
 
 
@@ -655,6 +671,76 @@ async def check_and_apply_trailing_stops():
     except Exception as e:
         print(f"[TRAILING STOP] Background task error: {e}")
 
+
+async def check_and_close_overdue_positions():
+    """Close positions that have been open longer than MAX_HOLD_TIME_MINUTES.
+
+    For 5m scalping, trades should not run for hours. This catches any
+    positions where the SL/trailing mechanism failed to trigger.
+    """
+    try:
+        positions_df = tl.get_all_positions()
+        if positions_df is None or positions_df.empty:
+            return
+
+        from datetime import datetime, timezone
+        now = datetime.now(timezone.utc)
+
+        for _, pos in positions_df.iterrows():
+            position_id = int(pos.get("id", 0))
+            instrument_id = int(pos.get("tradableInstrumentId", 0))
+            qty = float(pos.get("qty", 0.0))
+            side = pos.get("side", "")
+            avg_price = float(pos.get("avgPrice", 0.0))
+            unrealized_pl = float(pos.get("unrealizedPl", 0.0))
+
+            open_time_str = pos.get("openTime", "unknown")
+            try:
+                if isinstance(open_time_str, (int, float)):
+                    open_time = datetime.fromtimestamp(open_time_str / 1000, tz=timezone.utc)
+                else:
+                    open_time = datetime.fromisoformat(open_time_str.replace("Z", "+00:00"))
+            except (ValueError, TypeError, AttributeError):
+                open_time = None
+
+            if open_time is None:
+                continue
+
+            age_minutes = (now - open_time).total_seconds() / 60
+
+            if age_minutes > MAX_HOLD_TIME_MINUTES:
+                symbol_name = "UNKNOWN"
+                for sym, cfg in TOP_SYMBOLS.items():
+                    try:
+                        if tl.get_instrument_id_from_symbol_name(sym) == instrument_id:
+                            symbol_name = sym
+                            break
+                    except Exception:
+                        continue
+
+                print(
+                    f"[OVERDUE] Position {position_id} {symbol_name} {side} {qty} "
+                    f"open {age_minutes:.0f}m (limit {MAX_HOLD_TIME_MINUTES}m), "
+                    f"entry={avg_price}, PnL=${unrealized_pl:.2f} — CLOSING",
+                    flush=True,
+                )
+
+                try:
+                    tl.modify_position(position_id, {
+                        "stopLossType": "absolute",
+                        "stopLoss": avg_price,
+                    })
+                    print(
+                        f"[OVERDUE] Position {position_id}: SL moved to BE @{avg_price} for forced close",
+                        flush=True,
+                    )
+                except Exception as exc:
+                    print(f"[OVERDUE] Failed to set BE SL for position {position_id}: {exc}", flush=True)
+
+    except Exception as e:
+        print(f"[OVERDUE] Position age check error: {e}", flush=True)
+
+
 # Start background task on startup
 @app.on_event("startup")
 async def start_trailing_stop_monitor():
@@ -665,9 +751,11 @@ async def start_trailing_stop_monitor():
         while True:
             await asyncio.sleep(TRAILING_CHECK_INTERVAL)
             await check_and_apply_trailing_stops()
-    
+            await check_and_close_overdue_positions()
+
     asyncio.create_task(trailing_loop())
     print(f"[TRAILING STOP] Monitor started: trigger=${TRAILING_TRIGGER_PROFIT}→BE=${TRAILING_SL_BE_PROFIT}, trail=${TRAILING_DISTANCE_DOLLARS}, interval={TRAILING_CHECK_INTERVAL}s")
+    print(f"[OVERDUE] Position age limit={MAX_HOLD_TIME_MINUTES}min", flush=True)
 
 @app.post("/webhook")
 async def receive_tradingview_alert(request: Request):
@@ -785,6 +873,13 @@ def process_tradingview_alert(data: dict, task_id: str):
     valid, reason = validate_entry(tl_symbol, action, live_price, suggested_sl)
     if not valid:
         result = {"status": "rejected", "reason": reason}
+        log_alert(data, result)
+        return result
+
+    # Validate SL distance is reasonable even at minimum lot
+    sl_valid, sl_reason = validate_sl_distance(tl_symbol, action, live_price, suggested_sl)
+    if not sl_valid:
+        result = {"status": "rejected", "reason": sl_reason}
         log_alert(data, result)
         return result
     
