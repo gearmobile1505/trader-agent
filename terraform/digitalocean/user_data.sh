@@ -20,8 +20,8 @@ curl -fsSL https://ollama.com/install.sh | sh
 systemctl enable ollama
 systemctl start ollama
 
-# Pull llama3 model (in background)
-ollama pull llama3 &
+# Pull phi3:mini model (in background)
+ollama pull phi3:mini &
 
 # Create trader user
 useradd -m -s /bin/bash trader
@@ -114,15 +114,34 @@ SVC_EOF
 systemctl daemon-reload
 systemctl enable trader-agent
 
-# Configure Nginx reverse proxy
+# Harden SSH - allow key-based root login only
+sed -i 's/^#\?PermitRootLogin.*/PermitRootLogin without-password/' /etc/ssh/sshd_config
+sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication no/' /etc/ssh/sshd_config
+
+# Configure UFW - block all inbound except SSH
+ufw default deny incoming
+ufw default allow outgoing
+ufw allow 22/tcp comment 'SSH'
+ufw --force enable
+
+# Configure Nginx reverse proxy (localhost only - behind Cloudflare Tunnel)
 cat > /etc/nginx/sites-available/trader-agent << 'NGINX_EOF'
+limit_req_zone $binary_remote_addr zone=webhook:10m rate=5r/m;
+
 server {
-    listen 80;
-    listen [::]:80;
+    listen 127.0.0.1:8080;
     server_name _;
 
-    # Webhook endpoint - proxy to FastAPI
+    add_header X-Frame-Options DENY always;
+    add_header X-Content-Type-Options nosniff always;
+    add_header X-XSS-Protection "1; mode=block" always;
+    add_header Referrer-Policy no-referrer always;
+    add_header Content-Security-Policy "default-src 'none'; frame-ancestors 'none'" always;
+    add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
+
     location /webhook {
+        limit_req zone=webhook burst=2 nodelay;
+        limit_req_status 429;
         proxy_pass http://127.0.0.1:8000;
         proxy_http_version 1.1;
         proxy_set_header Upgrade $http_upgrade;
@@ -137,25 +156,26 @@ server {
         client_max_body_size 10M;
     }
 
-    # Health check endpoint
-    location /health {
-        proxy_pass http://127.0.0.1:8000/health;
+    location /status {
+        proxy_pass http://127.0.0.1:8000/status;
         proxy_set_header Host $host;
         proxy_set_header X-Real-IP $remote_addr;
     }
 
-    # API endpoints
-    location /api/ {
-        proxy_pass http://127.0.0.1:8000;
+    location /trailing-status {
+        proxy_pass http://127.0.0.1:8000/trailing-status;
         proxy_set_header Host $host;
         proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto $scheme;
     }
 
-    # Root redirect
+    location /symbols {
+        proxy_pass http://127.0.0.1:8000/symbols;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+    }
+
     location / {
-        return 301 /health;
+        return 301 /status;
     }
 }
 NGINX_EOF
@@ -163,6 +183,28 @@ NGINX_EOF
 ln -sf /etc/nginx/sites-available/trader-agent /etc/nginx/sites-enabled/
 rm -f /etc/nginx/sites-enabled/default
 nginx -t && systemctl reload nginx
+
+# Configure Cloudflare Tunnel to proxy through nginx:8080
+cat > /etc/systemd/system/cloudflared.service << 'CLOUD_EOF'
+[Unit]
+Description=Cloudflare Tunnel
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+ExecStart=/usr/local/bin/cloudflared tunnel --url http://127.0.0.1:8080 --protocol http2 --no-prechecks
+Restart=always
+RestartSec=30
+
+[Install]
+WantedBy=multi-user.target
+CLOUD_EOF
+
+systemctl daemon-reload
+systemctl enable cloudflared
+systemctl restart cloudflared
 
 # Set up log rotation
 cat > /etc/logrotate.d/trader-agent << 'LOGROTATE_EOF'
@@ -218,15 +260,15 @@ chown trader:trader /opt/trader-agent/deploy.sh
 
 # Wait for Ollama to be ready and pull model
 sleep 10
-ollama pull llama3
+ollama pull phi3:mini
 
 # Start the service
 systemctl start trader-agent
 
 # Wait for service to be ready
 sleep 5
-/opt/trader-agent/health_check.sh && echo "Service healthy" || echo "Service not healthy yet"
+curl -sf http://localhost:8080/status > /dev/null 2>&1 && echo "Service healthy" || echo "Service not healthy yet"
 
 echo "=== Setup completed at $(date) ==="
-echo "Webhook URL: http://$(curl -s ifconfig.me):8000/webhook"
-echo "Health check: http://$(curl -s ifconfig.me)/health"
+echo "Webhook URL: https://YOUR_TUNNEL_URL.trycloudflare.com/webhook"
+echo "Status: https://YOUR_TUNNEL_URL.trycloudflare.com/status"

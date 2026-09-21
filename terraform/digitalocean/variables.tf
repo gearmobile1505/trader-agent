@@ -74,7 +74,7 @@ variable "tradelocker_server" {
 variable "ollama_model" {
   description = "Ollama model to use"
   type        = string
-  default     = "llama3"
+  default     = "phi3:mini"
 }
 
 variable "risk_per_trade" {
