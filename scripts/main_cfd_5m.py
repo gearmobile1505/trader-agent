@@ -121,7 +121,7 @@ TOP_SYMBOLS = {
         "point_value": 100.0,
         "min_lot": 0.01,
         "max_spread": 5.0,
-        "sessions": ["NY"],
+        "sessions": ["NY_MORNING"],
         "description": "Palladium vs USD",
         "currency": "USD",
         "tick_size": 0.001
@@ -255,6 +255,7 @@ SESSIONS_ET = {
     "EU":   (3, 11),     # 3 AM - 11 AM ET
     "NY":   (9, 19),     # 9 AM - 7 PM ET (23h total coverage with ASIA)
     "NY_EARLY": (6, 9),  # 6 AM - 9 AM ET (pre-market for indices)
+    "NY_MORNING": (9, 13),  # 9 AM - 1 PM ET (high liquidity, tight spreads for metals)
 }
 
 def is_session_active(symbol_config: dict) -> bool:
@@ -269,7 +270,7 @@ def is_session_active(symbol_config: dict) -> bool:
     weekend = weekday >= 5  # Sat/Sun
     
     for session in symbol_config.get("sessions", []):
-        if weekend and session in ("NY", "NY_EARLY"):
+        if weekend and session in ("NY", "NY_EARLY", "NY_MORNING"):
             continue
         start, end = SESSIONS_ET.get(session, (0, 24))
         if start < end:
