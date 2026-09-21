@@ -264,12 +264,11 @@ def is_session_active(symbol_config: dict) -> bool:
     now_et = datetime.now(et)
     current_hour = now_et.hour + now_et.minute / 60
     weekday = now_et.weekday()  # 0=Mon, 4=Fri
-    
-    # Skip weekends
-    if weekday >= 5:
-        return False
+    weekend = weekday >= 5  # Sat/Sun
     
     for session in symbol_config.get("sessions", []):
+        if weekend and session in ("NY", "NY_EARLY"):
+            continue
         start, end = SESSIONS_ET.get(session, (0, 24))
         if start < end:
             if start <= current_hour < end:
@@ -781,7 +780,7 @@ async def receive_tradingview_alert(request: Request):
     
     try:
         response = ollama.chat(
-            model='llama3',
+            model='phi3:mini',
             messages=[{'role': 'user', 'content': prompt}]
         )
         agent_decision = response['message']['content']
