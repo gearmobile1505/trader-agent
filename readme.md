@@ -341,8 +341,8 @@ Test every update with the local status endpoint before re-enabling TradingView 
 ### 11. Final production checklist
 
 - [ ] TradingView uses the stable domain URL, not a `trycloudflare.com` URL.
-- [ ] `trader-agent` is active after a reboot and FastAPI listens only on `127.0.0.1:8000`.
-- [ ] `cloudflared` is active and its hostname resolves through Cloudflare.
+- `trader-agent` is active after a reboot and FastAPI listens only on `127.0.0.1:8000`.
+- [ ] `cloudflared` is active and its hostname resolves through Cloudflare. Note: current Quick Tunnel hostname is temporary. Replace with a named tunnel + domain before production use.
 - [ ] `/status` and `/symbols` respond through the public HTTPS hostname.
 - [ ] A harmless webhook reaches the service and is visible in `journalctl`.
 - [ ] `alerts_log.jsonl` exists, is writable by `trader`, and records the webhook result.
@@ -375,7 +375,7 @@ Test every update with the local status endpoint before re-enabling TradingView 
 - **Phantom Shift Strategy** — ATR(10) × 3.0 dynamic stop loss
 - **Trailing Stop** — $75 trigger, $50 trail distance on profitable positions
 - **AI Risk Assessment** — Ollama llama3 reviews every trade (approve/reject)
-- **Position Sizing** — $200 risk per trade, dynamic: `qty = $200 / (SL_distance × point_value)`, capped by max_lot
+- **Position Sizing** — $125 risk per trade, dynamic: `qty = $125 / (SL_distance × point_value)`, capped by max_lot
 - **Session Trading** — ASIA, EU, NY_EARLY, NY sessions
 
 ## AI Decision Flow
@@ -397,7 +397,7 @@ If Technical Summary contradicts the Phantom Signal, AI flags it as a risk facto
 
 | Parameter | Value |
 |-----------|-------|
-| Risk per Trade | $200 |
+| Risk per Trade | $125 |
 | Max Daily Loss | $400 |
 | Max Open Trades | 3 |
 | Min Risk:Reward | 1.5 |

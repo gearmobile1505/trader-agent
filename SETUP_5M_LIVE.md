@@ -67,7 +67,7 @@ Phantom Oscillator:
 | Field | Value |
 |-------|-------|
 | **Condition** | Click "Add Condition" twice:<br>1. `Phantom Combo Buy`<br>2. `Phantom Combo Sell` |
-| **Webhook URL** | `https://clean-worlds-prove.loca.lt/webhook` |
+| **Webhook URL** | `https://prozac-commands-spelling-decent.trycloudflare.com/webhook` |
 > ⚠️ This URL changes when localtunnel restarts. Run `cat ~/.trader_agent_tunnel_url` for current URL, or use the monitor script (`python3 scripts/monitor_tunnel.py`) for automatic alerts.
 | **Message (JSON)** | See below |
 | **Expiration** | Open-ended |
@@ -217,11 +217,11 @@ Based on typical prop firm offerings (Forex, Commodities, Indices, Crypto), here
 ### Risk Parameters (in `main_cfd_5m.py`)
 | Parameter | Value |
 |-----------|-------|
-| Risk per Trade | $200 |
+| Risk per Trade | $125 |
 | Max Daily Loss | $400 |
 | Max Open Trades | 3 |
 | Min Risk:Reward | 1.5 |
-| Position Sizing | Dynamic ($200 / SL_distance × point_value), capped at max_lot per symbol |
+| Position Sizing | Dynamic ($125 / SL_distance × point_value), capped at max_lot per symbol |
 | Max Lot | GBPJPY.R: 0.20, USDJPY.R: 0.30, others: 1.00 |
 | Stop Loss | Phantom Shift Band (ATR-based) |
 | Technical Summary | Computed live: EMA(9/21), SMA(50), RSI(14), MACD, ADX, Williams %R → Strong Buy/Buy/Neutral/Sell/Strong Sell. Fed to AI as directional bias check. Contradicting signals noted as risk factor. |
