@@ -66,6 +66,12 @@ resource "digitalocean_firewall" "trading_firewall" {
 
   outbound_rule {
     protocol              = "udp"
+    port_range            = "443"
+    destination_addresses = ["0.0.0.0/0", "::/0"]
+  }
+
+  outbound_rule {
+    protocol              = "udp"
     port_range            = "7844"
     destination_addresses = ["0.0.0.0/0", "::/0"]
   }
