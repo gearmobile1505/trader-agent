@@ -68,7 +68,7 @@ Phantom Oscillator:
 |-------|-------|
 | **Condition** | Click "Add Condition" twice:<br>1. `Phantom Combo Buy`<br>2. `Phantom Combo Sell` |
 | **Webhook URL** | `https://prozac-commands-spelling-decent.trycloudflare.com/webhook` |
-> ⚠️ This URL changes when localtunnel restarts. Run `cat ~/.trader_agent_tunnel_url` for current URL, or use the monitor script (`python3 scripts/monitor_tunnel.py`) for automatic alerts.
+> ⚠️ Quick Tunnel URL — will change if tunnel restarts. Find current: `ssh root@209.97.155.224 "journalctl -u cloudflared --no-pager -n 3 | grep trycloudflare"`. For production, use named tunnel (see readme.md §9).
 | **Message (JSON)** | See below |
 | **Expiration** | Open-ended |
 
