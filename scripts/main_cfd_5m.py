@@ -86,8 +86,8 @@ def log_alert(alert_data: dict, result: dict):
     try:
         with open(ALERT_LOG, "a") as f:
             f.write(json.dumps(entry) + "\n")
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"[LOG ALERT ERROR] {type(e).__name__}: {e}", flush=True)
 
 # Load broker credentials
 TL_ENV = os.getenv("TL_ENV", "https://demo.tradelocker.com")
@@ -201,9 +201,11 @@ TOP_SYMBOLS = {
         "tick_size": 0.001
     },
     "GBPJPY.R": {
-        "point_value": 3000.0,
+        "point_value": 100000.0,
+        "point_value_currency": "JPY",
+        "fallback_point_value": 650.0,
         "min_lot": 0.01,
-        "max_lot": 0.20,
+        "max_lot": 0.30,
         "max_spread": 2.0,
         "sessions": ["NY", "EU", "ASIA", "NY_EARLY"],
         "description": "British Pound vs Japanese Yen",
@@ -211,7 +213,9 @@ TOP_SYMBOLS = {
         "tick_size": 0.01
     },
     "USDJPY.R": {
-        "point_value": 3000.0,
+        "point_value": 100000.0,
+        "point_value_currency": "JPY",
+        "fallback_point_value": 650.0,
         "min_lot": 0.01,
         "max_lot": 0.30,
         "max_spread": 1.5,
@@ -305,9 +309,36 @@ def map_symbol(tv_symbol: str) -> str:
     base = tv_symbol.replace("1!", "").replace("!", "").upper()
     return SYMBOL_MAP.get(base, tv_symbol)
 
+_JPY_PV_CACHE: dict = {"value": None, "expires_at": 0.0}
+_JPY_PV_TTL = 60.0
+
 def get_point_value(tl_symbol: str) -> float:
-    """Get the USD value of a one-price-unit move for one lot."""
+    """Get the USD value of a one-price-unit move for one lot.
+
+    For JPY pairs (GBPJPY.R, USDJPY.R), dynamically calculates
+    100000 / USDJPY_rate using a cached live USDJPY bid price.
+    Falls back to a static value if the price can't be fetched.
+    """
     symbol_config = TOP_SYMBOLS.get(tl_symbol, {})
+
+    if symbol_config.get("point_value_currency") == "JPY":
+        now = datetime.now().timestamp()
+        if _JPY_PV_CACHE["value"] is not None and now < _JPY_PV_CACHE["expires_at"]:
+            return _JPY_PV_CACHE["value"]
+
+        try:
+            usd_jpy_id = tl.get_instrument_id_from_symbol_name("USDJPY.R")
+            usd_jpy_price = tl.get_latest_bid_price(usd_jpy_id)
+            if usd_jpy_price > 0:
+                value = 100000.0 / usd_jpy_price
+                _JPY_PV_CACHE["value"] = value
+                _JPY_PV_CACHE["expires_at"] = now + _JPY_PV_TTL
+                return value
+        except Exception as exc:
+            print(f"[POINT VALUE] Could not fetch USDJPY for JPY conversion: {exc}", flush=True)
+
+        return symbol_config.get("fallback_point_value", 650.0)
+
     return symbol_config.get("point_value", 1.0)
 
 def get_min_lot(tl_symbol: str) -> float:
@@ -835,6 +866,14 @@ def process_tradingview_alert(data: dict, task_id: str):
         indicator_val = 0.0
     
     # Map to TradeLocker symbol
+    if not tv_ticker:
+        result = {
+            "status": "rejected",
+            "reason": "Missing or null 'ticker' field in alert payload"
+        }
+        log_alert(data, result)
+        return result
+
     tl_symbol = map_symbol(tv_ticker)
     
     # Validate symbol is in our top list
@@ -1162,8 +1201,9 @@ async def list_symbols():
         "symbols": {
             sym: {
                 "description": cfg["description"],
-                "point_value": cfg["point_value"],
+                "point_value": get_point_value(sym),
                 "min_lot": cfg["min_lot"],
+                "max_lot": cfg.get("max_lot", 1.0),
                 "sessions": cfg["sessions"],
                 "session_active": is_session_active(cfg)
             }
