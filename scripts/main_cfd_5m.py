@@ -929,21 +929,27 @@ Evaluate this trade for a 5M scalping prop challenge. Output ONLY valid JSON: {{
         log_alert(data, result)
         return result
     
-    # Parse Ollama JSON response (handles plain JSON and markdown-wrapped)
+    # Parse Ollama JSON response (handles plain JSON, markdown-wrapped, multi-block)
     decision = "DENY"
     confidence = 0.0
     try:
         text = agent_decision.strip()
-        # Extract JSON from markdown code blocks if present
-        json_match = re.search(r'\{.*\}', text, re.DOTALL)
-        if json_match:
-            ai_response = json.loads(json_match.group(0))
-            decision = ai_response.get("decision", "").upper()
-            confidence = ai_response.get("confidence", 0.0)
-        elif "ALLOW" in text.upper():
-            decision = "ALLOW"
-        elif "APPROVED" in text.upper():
-            decision = "ALLOW"
+        # Find all potential JSON objects (non-greedy)
+        json_candidates = re.findall(r'\{[^{}]*\}', text, re.DOTALL)
+        for candidate in json_candidates:
+            try:
+                # Fix invalid numbers like 00.4 (leading zeros)
+                fixed = re.sub(r':\s*0+(\d)', lambda m: f': {m.group(1)}', candidate)
+                ai_response = json.loads(fixed)
+                if "decision" in ai_response:
+                    decision = ai_response.get("decision", "").upper()
+                    confidence = ai_response.get("confidence", 0.0)
+                    break
+            except (json.JSONDecodeError, ValueError):
+                continue
+        if decision == "DENY":
+            if "ALLOW" in text.upper() or "APPROVED" in text.upper():
+                decision = "ALLOW"
     except Exception as exc:
         print(f"[AI] JSON parse failed: {exc}, defaulting to DENY", flush=True)
         decision = "DENY"
