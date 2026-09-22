@@ -119,7 +119,7 @@ TOP_SYMBOLS = {
         "point_value": 100.0,
         "min_lot": 0.01,
         "max_spread": 5.0,
-        "sessions": ["NY_MORNING"],
+        "sessions": ["NY", "EU", "ASIA", "NY_EARLY"],
         "description": "Palladium vs USD",
         "currency": "USD",
         "tick_size": 0.001
@@ -201,7 +201,7 @@ TOP_SYMBOLS = {
         "min_lot": 0.01,
         "max_lot": 0.20,
         "max_spread": 2.0,
-        "sessions": ["ASIA", "EU", "NY_EARLY"],
+        "sessions": ["NY", "EU", "ASIA", "NY_EARLY"],
         "description": "British Pound vs Japanese Yen",
         "currency": "USD",
         "tick_size": 0.01
@@ -211,7 +211,7 @@ TOP_SYMBOLS = {
         "min_lot": 0.01,
         "max_lot": 0.30,
         "max_spread": 1.5,
-        "sessions": ["ASIA"],
+        "sessions": ["NY", "EU", "ASIA", "NY_EARLY"],
         "description": "US Dollar vs Japanese Yen",
         "currency": "USD",
         "tick_size": 0.01
