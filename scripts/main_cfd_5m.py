@@ -229,7 +229,7 @@ MAX_DAILY_LOSS = 400.0            # Stop trading if -$400/day
 MAX_OPEN_TRADES = 3               # Max concurrent positions
 MIN_RISK_REWARD = 1.5             # Min R:R for entry
 MAX_HOLD_TIME_MINUTES = 45        # Max time a trade can be open (5m scalping)
-MAX_SL_OVERSHOOT_PCT = 20         # Max % over $125 risk at SL (min lot basis): 150 = reject
+MAX_SL_OVERSHOOT_PCT = 100          # Max % over target risk at SL (min lot basis)
 
 # Take Profit Configuration
 # TP1 = $150 minimum (satisfies 1.5x R:R on $100 risk)
@@ -840,9 +840,9 @@ def process_tradingview_alert(data: dict, task_id: str):
         return result
     
     MIN_SL_PCT = {
-        "GBPJPY.R": 0.005, "USDJPY.R": 0.005,
-        "US30.R": 0.005, "NAS100.R": 0.005, "SPX500.R": 0.005,
-        "XAUUSD.R": 0.005, "XPDUSD.R": 0.005, "UKOIL.R": 0.005,
+        "GBPJPY.R": 0.003, "USDJPY.R": 0.003,
+        "US30.R": 0.003, "NAS100.R": 0.003, "SPX500.R": 0.003,
+        "XAUUSD.R": 0.005, "XPDUSD.R": 0.005, "UKOIL.R": 0.003,
         "LVMH": 0.005, "SIEMENS": 0.005, "ALPHABET-C": 0.005, "GE": 0.005,
     }
 
