@@ -913,6 +913,11 @@ def process_tradingview_alert(data: dict, task_id: str):
         "XAUUSD.R": 0.005, "XPDUSD.R": 0.005, "UKOIL.R": 0.003,
         "LVMH": 0.005, "SIEMENS": 0.005, "ALPHABET-C": 0.005, "GE": 0.005,
     }
+    # Wider percentage-based SL fallback for when ATR can't be calculated
+    FALLBACK_SL_PCT = {
+        "GBPJPY.R": 0.010, "USDJPY.R": 0.010,
+        "XPDUSD.R": 0.020, "XAUUSD.R": 0.020, "UKOIL.R": 0.020,
+    }
 
     print(f"[LIVE PRICE] {tl_symbol}: live_price={live_price}, webhook_price={indicator_val}", flush=True)
     
@@ -923,9 +928,13 @@ def process_tradingview_alert(data: dict, task_id: str):
             suggested_sl = atr_sl
             print(f"[AUTO-SL] {tl_symbol} {action}: Calculated SL from ATR(10)*3 = {suggested_sl}")
         else:
-            result = {"status": "rejected", "reason": "Could not calculate stop loss from ATR"}
-            log_alert(data, result)
-            return result
+            # Fallback: percentage-based SL when ATR data unavailable
+            fallback_pct = FALLBACK_SL_PCT.get(tl_symbol, 0.015)
+            if action == "buy":
+                suggested_sl = live_price * (1 - fallback_pct)
+            else:
+                suggested_sl = live_price * (1 + fallback_pct)
+            print(f"[ATR FALLBACK] {tl_symbol} {action}: ATR unavailable, using {fallback_pct:.1%} fallback SL = {suggested_sl}", flush=True)
     
     # Round SL to symbol's tick size (broker requirement)
     tick_size = TOP_SYMBOLS[tl_symbol].get("tick_size", 0.01)
@@ -991,15 +1000,16 @@ Evaluate this trade for a 5M scalping prop challenge. Output ONLY valid JSON: {{
             messages=[{'role': 'user', 'content': prompt}]
         )
         agent_decision = response['message']['content']
-        print(f"[AI DECISION] {agent_decision}", flush=True)
+        print(f"[AI DECISION] {agent_decision[:200]}", flush=True)
     except Exception as e:
         result = {"status": "error", "message": f"AI Agent unavailable: {str(e)}"}
         log_alert(data, result)
         return result
     
     # Parse Ollama JSON response (handles plain JSON, markdown-wrapped, multi-block)
-    decision = "DENY"
-    confidence = 0.0
+        decision = "DENY"
+        confidence = 0.0
+        reason = "no reason provided"
     try:
         text = agent_decision.strip()
         # Find all potential JSON objects (non-greedy)
@@ -1012,6 +1022,7 @@ Evaluate this trade for a 5M scalping prop challenge. Output ONLY valid JSON: {{
                 if "decision" in ai_response:
                     decision = ai_response.get("decision", "").upper()
                     confidence = ai_response.get("confidence", 0.0)
+                    reason = ai_response.get("reason", "no reason provided")
                     break
             except (json.JSONDecodeError, ValueError):
                 continue
@@ -1021,6 +1032,9 @@ Evaluate this trade for a 5M scalping prop challenge. Output ONLY valid JSON: {{
     except Exception as exc:
         print(f"[AI] JSON parse failed: {exc}, defaulting to DENY", flush=True)
         decision = "DENY"
+
+    agent_notes = f"{decision} (confidence: {confidence:.2f}): {reason}"
+    print(f"[AI PARSED] {agent_notes}", flush=True)
 
     if decision == "ALLOW":
         try:
@@ -1122,7 +1136,7 @@ Evaluate this trade for a 5M scalping prop challenge. Output ONLY valid JSON: {{
                 "description": TOP_SYMBOLS[tl_symbol]["description"],
                 "executed_quantity": quantity,
                 "risk_dollars": TARGET_DOLLAR_RISK,
-                "agent_notes": agent_decision,
+                "agent_notes": agent_notes,
                 "technical_summary": tech_summary,
                 "broker_response": str(order_response),
                 "tp_levels": tp_info
@@ -1134,7 +1148,7 @@ Evaluate this trade for a 5M scalping prop challenge. Output ONLY valid JSON: {{
             log_alert(data, result)
             return result
     
-    result = {"status": "blocked", "agent_notes": agent_decision, "technical_summary": tech_summary, "tl_symbol": tl_symbol}
+    result = {"status": "blocked", "agent_notes": agent_notes, "technical_summary": tech_summary, "tl_symbol": tl_symbol}
     log_alert(data, result)
     return result
 
