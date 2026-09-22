@@ -27,6 +27,9 @@ ALERT_LOG = "/opt/trader-agent/scripts/alerts_log.jsonl"
 
 # Trailing Stop Configuration
 TRAILING_SL_BE_PROFIT = 100.0       # Move SL to breakeven when P&L >= $100
+POSITION_MONITOR_INTERVAL_SECONDS = 30
+POSITION_MONITOR_EMPTY_INTERVAL_SECONDS = 120
+POSITION_MONITOR_MAX_BACKOFF_SECONDS = 300
 
 # Gzip decompression + JSON fix middleware
 @app.middleware("http")
@@ -622,12 +625,13 @@ def get_technical_summary(tl_symbol: str) -> str:
 # Track positions that already have breakeven SL applied
 _be_applied_positions: set[int] = set()
 
-async def check_and_apply_trailing_stops():
+async def check_and_apply_trailing_stops(positions_df=None):
     """Background task: move SL to breakeven when profitable."""
     global _be_applied_positions
 
-    try:
+    if positions_df is None:
         positions_df = tl.get_all_positions()
+    try:
         if positions_df is None or positions_df.empty:
             return
 
@@ -659,14 +663,15 @@ async def check_and_apply_trailing_stops():
         print(f"[BE SL] Background task error: {e}", flush=True)
 
 
-async def check_and_close_overdue_positions():
+async def check_and_close_overdue_positions(positions_df=None):
     """Close positions that have been open longer than MAX_HOLD_TIME_MINUTES.
 
     For 5m scalping, trades should not run for hours. This catches any
     positions where the SL/trailing mechanism failed to trigger.
     """
-    try:
+    if positions_df is None:
         positions_df = tl.get_all_positions()
+    try:
         if positions_df is None or positions_df.empty:
             return
 
@@ -735,13 +740,37 @@ async def start_trailing_stop_monitor():
     import asyncio
     
     async def be_check_loop():
+        monitor_interval = POSITION_MONITOR_INTERVAL_SECONDS
         while True:
-            await asyncio.sleep(30)
-            await check_and_apply_trailing_stops()
-            await check_and_close_overdue_positions()
+            await asyncio.sleep(monitor_interval)
+            try:
+                positions_df = tl.get_all_positions()
+            except Exception as exc:
+                monitor_interval = min(
+                    monitor_interval * 2,
+                    POSITION_MONITOR_MAX_BACKOFF_SECONDS,
+                )
+                print(
+                    f"[POSITION MONITOR] Broker check failed; retrying in {monitor_interval}s: {exc}",
+                    flush=True,
+                )
+                continue
+
+            if positions_df is None or positions_df.empty:
+                _be_applied_positions.clear()
+                monitor_interval = POSITION_MONITOR_EMPTY_INTERVAL_SECONDS
+                continue
+
+            monitor_interval = POSITION_MONITOR_INTERVAL_SECONDS
+            await check_and_apply_trailing_stops(positions_df)
+            await check_and_close_overdue_positions(positions_df)
 
     asyncio.create_task(be_check_loop())
-    print(f"[BE SL] Monitor started: trigger=${TRAILING_SL_BE_PROFIT}, interval=30s", flush=True)
+    print(
+        f"[BE SL] Monitor started: trigger=${TRAILING_SL_BE_PROFIT}, "
+        f"interval={POSITION_MONITOR_INTERVAL_SECONDS}s, empty={POSITION_MONITOR_EMPTY_INTERVAL_SECONDS}s",
+        flush=True,
+    )
     print(f"[OVERDUE] Position age limit={MAX_HOLD_TIME_MINUTES}min", flush=True)
 
 @app.post("/webhook")
