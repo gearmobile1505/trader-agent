@@ -25,7 +25,7 @@ app = FastAPI()
 ALERT_LOG = "/opt/trader-agent/scripts/alerts_log.jsonl"
 
 # Trailing Stop Configuration
-TRAILING_SL_BE_PROFIT = 80.0         # Move SL to breakeven when P&L >= $80
+TRAILING_SL_BE_PROFIT = 100.0       # Move SL to breakeven when P&L >= $100
 
 # Gzip decompression + JSON fix middleware
 @app.middleware("http")
@@ -231,20 +231,20 @@ MAX_HOLD_TIME_MINUTES = 45        # Max time a trade can be open (5m scalping)
 MAX_SL_OVERSHOOT_PCT = 20         # Max % over $125 risk at SL (min lot basis): 150 = reject
 
 # Take Profit Configuration
-# TP1 = $100 for all symbols
+# TP1 = $150 minimum (satisfies 1.5x R:R on $100 risk)
 TP_CONFIG = {
-    "US30.R":     {"tp1_dollars": 100, "tp2_dollars": None, "trail_after_tp1": True},
-    "NAS100.R":   {"tp1_dollars": 100, "tp2_dollars": None, "trail_after_tp1": True},
-    "SPX500.R":   {"tp1_dollars": 100, "tp2_dollars": None, "trail_after_tp1": False},
-    "XAUUSD.R":   {"tp1_dollars": 100, "tp2_dollars": None, "trail_after_tp1": False},
-    "XPDUSD.R":   {"tp1_dollars": 100, "tp2_dollars": None, "trail_after_tp1": False},
-    "UKOIL.R":    {"tp1_dollars": 100, "tp2_dollars": None, "trail_after_tp1": False},
-    "LVMH":       {"tp1_dollars": 100, "tp2_dollars": None, "trail_after_tp1": True},
-    "SIEMENS":    {"tp1_dollars": 100, "tp2_dollars": None, "trail_after_tp1": True},
-    "ALPHABET-C": {"tp1_dollars": 100, "tp2_dollars": None, "trail_after_tp1": True},
-    "GE":         {"tp1_dollars": 100, "tp2_dollars": None, "trail_after_tp1": True},
-    "GBPJPY.R":   {"tp1_dollars": 100, "tp2_dollars": None, "trail_after_tp1": True},
-    "USDJPY.R":   {"tp1_dollars": 100, "tp2_dollars": None, "trail_after_tp1": True},
+    "US30.R":     {"tp1_dollars": 150, "tp2_dollars": None, "trail_after_tp1": True},
+    "NAS100.R":   {"tp1_dollars": 150, "tp2_dollars": None, "trail_after_tp1": True},
+    "SPX500.R":   {"tp1_dollars": 150, "tp2_dollars": None, "trail_after_tp1": False},
+    "XAUUSD.R":   {"tp1_dollars": 150, "tp2_dollars": None, "trail_after_tp1": False},
+    "XPDUSD.R":   {"tp1_dollars": 150, "tp2_dollars": None, "trail_after_tp1": False},
+    "UKOIL.R":    {"tp1_dollars": 150, "tp2_dollars": None, "trail_after_tp1": False},
+    "LVMH":       {"tp1_dollars": 150, "tp2_dollars": None, "trail_after_tp1": True},
+    "SIEMENS":    {"tp1_dollars": 150, "tp2_dollars": None, "trail_after_tp1": True},
+    "ALPHABET-C": {"tp1_dollars": 150, "tp2_dollars": None, "trail_after_tp1": True},
+    "GE":         {"tp1_dollars": 150, "tp2_dollars": None, "trail_after_tp1": True},
+    "GBPJPY.R":   {"tp1_dollars": 150, "tp2_dollars": None, "trail_after_tp1": True},
+    "USDJPY.R":   {"tp1_dollars": 150, "tp2_dollars": None, "trail_after_tp1": True},
 }
 
 # Session time ranges (ET)
@@ -309,31 +309,36 @@ def get_point_value(tl_symbol: str) -> float:
 def get_min_lot(tl_symbol: str) -> float:
     return TOP_SYMBOLS.get(tl_symbol, {}).get("min_lot", 0.01)
 
-# EUR/USD rate for EUR-denominated symbols (approximate, update periodically)
-EUR_USD_RATE = 1.08
+def quantize_price(price: float, tick_size: float) -> float:
+    return round(round(price / tick_size) * tick_size, 6)
 
-def calculate_position_size(ticker: str, entry_price: float, stop_loss: float) -> float:
-    """Dynamic position sizing based on $200 risk, handles EUR/USD conversion."""
+def calculate_position_size(ticker: str, entry_price: float, stop_loss: float) -> float | None:
+    """Dynamic position sizing based on $100 risk. Returns None if max_lot exceeded."""
     sl_distance = abs(entry_price - stop_loss)
     if sl_distance == 0:
         return get_min_lot(ticker)
-    
+
     tl_symbol = map_symbol(ticker)
     point_val = get_point_value(tl_symbol)
     currency = TOP_SYMBOLS.get(tl_symbol, {}).get("currency", "USD")
-    
-    # Convert risk per lot to USD
+
     risk_per_lot = sl_distance * point_val
     if currency == "EUR":
         risk_per_lot *= EUR_USD_RATE
-    
+
     if risk_per_lot <= 0:
         return get_min_lot(tl_symbol)
-    
+
     calculated_qty = TARGET_DOLLAR_RISK / risk_per_lot
     min_lot = get_min_lot(tl_symbol)
     max_lot = TOP_SYMBOLS.get(tl_symbol, {}).get("max_lot", 1.0)
+
+    if calculated_qty > max_lot and max_lot > 0:
+        return None
+
     return round(max(min_lot, min(calculated_qty, max_lot)), 2)
+
+EUR_USD_RATE = 1.08
 
 def validate_entry(tl_symbol: str, action: str, entry: float, sl: float) -> tuple[bool, str]:
     """Validate trade entry against risk rules."""
@@ -377,6 +382,30 @@ def validate_sl_distance(tl_symbol: str, action: str, entry: float, sl: float) -
         )
 
     return True, "OK"
+
+
+def validate_spread(tl_symbol: str) -> tuple[bool, str]:
+    """Validate current spread is within symbol's max_spread tolerance."""
+    if tl_symbol not in TOP_SYMBOLS:
+        return False, f"Symbol {tl_symbol} not in approved list"
+
+    max_spread = TOP_SYMBOLS[tl_symbol].get("max_spread", 5.0)
+    try:
+        instrument_id = tl.get_instrument_id_from_symbol_name(tl_symbol)
+        bid = tl.get_latest_bid_price(instrument_id)
+        ask = tl.get_latest_asking_price(instrument_id)
+        if bid <= 0 or ask <= 0:
+            return True, "Spread data unavailable, skipping check"
+
+        spread = abs(ask - bid)
+        if spread > max_spread:
+            return False, (
+                f"Spread {spread:.4f} exceeds max {max_spread} for {tl_symbol}"
+            )
+        return True, "OK"
+    except Exception as exc:
+        print(f"[SPREAD] Could not check spread for {tl_symbol}: {exc}", flush=True)
+        return True, "Spread check skipped"
 
 
 def get_live_price(tl_symbol: str) -> float:
@@ -442,7 +471,7 @@ def calculate_atr_sl(tl_symbol: str, action: str, current_price: float) -> float
         
         # Round to symbol's tick size
         tick_size = TOP_SYMBOLS.get(tl_symbol, {}).get("tick_size", 0.01)
-        sl_price = round(sl_price / tick_size) * tick_size
+        sl_price = quantize_price(sl_price, tick_size)
         return sl_price
     except Exception as e:
         print(f"[ATR DEBUG] {tl_symbol}: Exception: {e}", flush=True)
@@ -824,7 +853,7 @@ def process_tradingview_alert(data: dict, task_id: str):
     
     # Round SL to symbol's tick size (broker requirement)
     tick_size = TOP_SYMBOLS[tl_symbol].get("tick_size", 0.01)
-    suggested_sl = round(suggested_sl / tick_size) * tick_size
+    suggested_sl = quantize_price(suggested_sl, tick_size)
     
     # Validate entry against live price
     valid, reason = validate_entry(tl_symbol, action, live_price, suggested_sl)
@@ -839,26 +868,35 @@ def process_tradingview_alert(data: dict, task_id: str):
         result = {"status": "rejected", "reason": sl_reason}
         log_alert(data, result)
         return result
-    
+
+    # Check spread is within tolerance
+    spread_valid, spread_reason = validate_spread(tl_symbol)
+    if not spread_valid:
+        result = {"status": "rejected", "reason": spread_reason}
+        log_alert(data, result)
+        return result
+
+    # Check max concurrent positions
+    try:
+        positions_df = tl.get_all_positions()
+        if positions_df is not None and len(positions_df) >= MAX_OPEN_TRADES:
+            result = {"status": "rejected", "reason": f"Max {MAX_OPEN_TRADES} concurrent positions reached"}
+            log_alert(data, result)
+            return result
+    except Exception as exc:
+        print(f"[POSITION CHECK] Could not check open positions: {exc}", flush=True)
+
     # Calculate preliminary quantity for AI prompt
     prelim_qty = calculate_position_size(tv_ticker, live_price, suggested_sl)
-    
-    # AI Risk Check
-    prompt = f"""
-    Strict risk management for 5M scalping prop challenge. Answer ONLY 'APPROVED' or 'REJECTED' + brief reason.
-    - Symbol: {tv_ticker} -> {tl_symbol} ({TOP_SYMBOLS[tl_symbol]['description']})
-    - Action: {action}
-    - Entry: {live_price}
-    - Stop Loss: {suggested_sl}
-    - SL Distance: {abs(live_price - suggested_sl):.2f} points
-    - Position Size: {prelim_qty} lots
-    - Risk: ${TARGET_DOLLAR_RISK}
-    - Trend: {trend_context}
-    - Technical Summary: {tech_summary}
-    - Session Check: {TOP_SYMBOLS[tl_symbol]['sessions']}
-    Rules: Max 3 concurrent trades, $500 daily loss limit, min 1.5 R:R
-    Technical Summary acts as a directional bias: if it contradicts the trade direction, note it as a risk factor.
-    """
+    if prelim_qty is None:
+        result = {"status": "rejected", "reason": f"Position size exceeds max_lot for {tl_symbol} at $100 risk"}
+        log_alert(data, result)
+        return result
+
+    # AI Risk Check (structured JSON for low-latency parsing)
+    prompt = f"""{{"symbol":"{tv_ticker}","tl_symbol":"{tl_symbol}","action":"{action}","entry":{live_price},"sl":{suggested_sl},"sl_dist":{abs(live_price - suggested_sl):.2f},"qty":{prelim_qty},"risk":{TARGET_DOLLAR_RISK},"trend":"{trend_context}","tech":"{tech_summary}","sessions":{TOP_SYMBOLS[tl_symbol]['sessions']},"rules":"max 3 concurrent, $400 daily loss, 1.5x R:R"}}
+Evaluate this trade for a 5M scalping prop challenge. Output ONLY valid JSON: {{"decision":"ALLOW"|"DENY","confidence":0.0-1.0,"reason":"brief"}}. Check for trend/technical direction conflicts. Decision must be ALLOW or DENY.
+"""
     
     try:
         response = ollama.chat(
@@ -872,16 +910,31 @@ def process_tradingview_alert(data: dict, task_id: str):
         log_alert(data, result)
         return result
     
-    if "APPROVED" in agent_decision.upper():
+    # Parse Ollama JSON response
+    try:
+        import json as json_parse
+        ai_response = json_parse.loads(agent_decision.strip())
+        decision = ai_response.get("decision", "").upper()
+        confidence = ai_response.get("confidence", 0.0)
+    except (json_parse.JSONDecodeError, AttributeError):
+        # Fallback: check for ALLOW/APPROVE in text response
+        decision = "ALLOW" if "ALLOW" in agent_decision.upper() or "APPROVED" in agent_decision.upper() else "DENY"
+        confidence = 0.0
+
+    if decision == "ALLOW":
         try:
             instrument_id = tl.get_instrument_id_from_symbol_name(tl_symbol)
-            
+
             # Recalculate position size with live price and validated SL (in case price moved slightly)
             quantity = calculate_position_size(tv_ticker, live_price, suggested_sl)
-            
+            if quantity is None:
+                result = {"status": "rejected", "reason": f"Position size exceeds max_lot for {tl_symbol}"}
+                log_alert(data, result)
+                return result
+
             # Calculate take profit price based on TP config
             tp_config = TP_CONFIG.get(tl_symbol, {})
-            tp1_dollars = tp_config.get("tp1_dollars", 300)
+            tp1_dollars = tp_config.get("tp1_dollars", 150)
             tp2_dollars = tp_config.get("tp2_dollars")
             
             # Convert TP dollars to price distance
@@ -890,31 +943,27 @@ def process_tradingview_alert(data: dict, task_id: str):
             if currency == "EUR":
                 point_value *= 1.08  # EUR/USD conversion
             
-            # TP1 = 1.5R ($300) - calculate absolute price level from LIVE price
+            # TP1 = $150 (1.5R on $100 risk)
             tp1_distance = tp1_dollars / (quantity * point_value)
-            tp1_distance = round(tp1_distance / tick_size) * tick_size
+            tp1_distance = quantize_price(tp1_distance, tick_size)
             
             # Calculate absolute TP price from LIVE entry price
             if action == "buy":
                 tp1_price = live_price + tp1_distance
             else:  # sell
                 tp1_price = live_price - tp1_distance
-            tp1_price = round(tp1_price / tick_size) * tick_size
+            tp1_price = quantize_price(tp1_price, tick_size)
             
             # Debug logging
             print(f"[TP DEBUG] {tl_symbol} {action}: entry={live_price}, sl={suggested_sl}, qty={quantity}, "
                   f"point_value={point_value}, tp1_distance={tp1_distance}, tp1_price={tp1_price}, tick_size={tick_size}", flush=True)
-            if not valid:
-                result = {"status": "rejected", "reason": reason}
-                log_alert(data, result)
-                return result
             
             # Recalculate position size with live price and validated SL
             quantity = calculate_position_size(tv_ticker, live_price, suggested_sl)
             
             # Calculate take profit price based on TP config
             tp_config = TP_CONFIG.get(tl_symbol, {})
-            tp1_dollars = tp_config.get("tp1_dollars", 300)
+            tp1_dollars = tp_config.get("tp1_dollars", 150)
             tp2_dollars = tp_config.get("tp2_dollars")
             
             # Convert TP dollars to price distance
@@ -923,16 +972,16 @@ def process_tradingview_alert(data: dict, task_id: str):
             if currency == "EUR":
                 point_value *= 1.08  # EUR/USD conversion
             
-            # TP1 = 1.5R ($300) - calculate absolute price level from LIVE price
+            # TP1 = $150 (1.5R on $100 risk)
             tp1_distance = tp1_dollars / (quantity * point_value)
-            tp1_distance = round(tp1_distance / tick_size) * tick_size
+            tp1_distance = quantize_price(tp1_distance, tick_size)
             
             # Calculate absolute TP price from LIVE entry price
             if action == "buy":
                 tp1_price = live_price + tp1_distance
             else:  # sell
                 tp1_price = live_price - tp1_distance
-            tp1_price = round(tp1_price / tick_size) * tick_size
+            tp1_price = quantize_price(tp1_price, tick_size)
             
             # Debug logging
             print(f"[TP DEBUG] {tl_symbol} {action}: entry={live_price}, sl={suggested_sl}, qty={quantity}, "
@@ -955,12 +1004,12 @@ def process_tradingview_alert(data: dict, task_id: str):
             tp_info = f"TP1: ${tp1_dollars} (abs {tp1_price})"
             if tp2_dollars:
                 tp2_distance = tp2_dollars / (quantity * point_value)
-                tp2_distance = round(tp2_distance / tick_size) * tick_size
+                tp2_distance = quantize_price(tp2_distance, tick_size)
                 if action == "buy":
                     tp2_price = live_price + tp2_distance
                 else:
                     tp2_price = live_price - tp2_distance
-                tp2_price = round(tp2_price / tick_size) * tick_size
+                tp2_price = quantize_price(tp2_price, tick_size)
                 tp_info += f", TP2: ${tp2_dollars} (abs {tp2_price})"
             if tp_config.get("trail_after_tp1"):
                 tp_info += ", Trail after TP1"
