@@ -8,6 +8,7 @@ Top symbols: LVMH, XPDUSD.R, ALPHABET-C, UKOIL.R, SIEMENS, GE
 import os
 import json
 import gzip
+import re
 import asyncio
 from uuid import uuid4
 from datetime import datetime, timedelta
@@ -929,7 +930,6 @@ Evaluate this trade for a 5M scalping prop challenge. Output ONLY valid JSON: {{
         return result
     
     # Parse Ollama JSON response (handles plain JSON and markdown-wrapped)
-    import re
     decision = "DENY"
     confidence = 0.0
     try:
