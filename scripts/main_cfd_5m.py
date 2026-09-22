@@ -838,6 +838,13 @@ def process_tradingview_alert(data: dict, task_id: str):
         log_alert(data, result)
         return result
     
+    MIN_SL_PCT = {
+        "GBPJPY.R": 0.005, "USDJPY.R": 0.005,
+        "US30.R": 0.005, "NAS100.R": 0.005, "SPX500.R": 0.005,
+        "XAUUSD.R": 0.005, "XPDUSD.R": 0.005, "UKOIL.R": 0.005,
+        "LVMH": 0.005, "SIEMENS": 0.005, "ALPHABET-C": 0.005, "GE": 0.005,
+    }
+
     print(f"[LIVE PRICE] {tl_symbol}: live_price={live_price}, webhook_price={indicator_val}", flush=True)
     
     # Auto-calculate SL from ATR if not provided or invalid (handles TradingView placeholder strings)
@@ -854,6 +861,17 @@ def process_tradingview_alert(data: dict, task_id: str):
     # Round SL to symbol's tick size (broker requirement)
     tick_size = TOP_SYMBOLS[tl_symbol].get("tick_size", 0.01)
     suggested_sl = quantize_price(suggested_sl, tick_size)
+    
+    # Enforce minimum SL distance (prevents ATR from giving too-tight stops)
+    min_sl_dist = live_price * MIN_SL_PCT.get(tl_symbol, 0.005)
+    actual_sl_dist = abs(live_price - suggested_sl)
+    if actual_sl_dist < min_sl_dist:
+        print(f"[MIN SL] {tl_symbol}: SL dist {actual_sl_dist:.2f} < min {min_sl_dist:.2f}, expanding", flush=True)
+        if action == "buy":
+            suggested_sl = live_price - min_sl_dist
+        else:
+            suggested_sl = live_price + min_sl_dist
+        suggested_sl = quantize_price(suggested_sl, tick_size)
     
     # Validate entry against live price
     valid, reason = validate_entry(tl_symbol, action, live_price, suggested_sl)
