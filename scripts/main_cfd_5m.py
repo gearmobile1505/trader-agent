@@ -118,7 +118,7 @@ TOP_SYMBOLS = {
     "XPDUSD.R": {
         "point_value": 100.0,
         "min_lot": 0.01,
-        "max_spread": 5.0,
+        "max_spread": 2.0,
         "sessions": ["NY", "EU"],
         "description": "Palladium vs USD",
         "currency": "USD",
