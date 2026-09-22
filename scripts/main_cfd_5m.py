@@ -119,7 +119,7 @@ TOP_SYMBOLS = {
         "point_value": 100.0,
         "min_lot": 0.01,
         "max_spread": 5.0,
-        "sessions": ["NY", "EU", "ASIA", "NY_EARLY"],
+        "sessions": ["NY", "EU"],
         "description": "Palladium vs USD",
         "currency": "USD",
         "tick_size": 0.001
@@ -223,7 +223,7 @@ SHIFT_ATR_PERIOD = 10
 SHIFT_MULTIPLIER = 3.0
 
 # Risk Management
-TARGET_DOLLAR_RISK = 125.0        # $125 risk per trade
+TARGET_DOLLAR_RISK = 100.0        # $100 risk per trade
 MAX_DAILY_LOSS = 400.0            # Stop trading if -$400/day
 MAX_OPEN_TRADES = 3               # Max concurrent positions
 MIN_RISK_REWARD = 1.5             # Min R:R for entry
