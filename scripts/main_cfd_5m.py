@@ -25,10 +25,7 @@ app = FastAPI()
 ALERT_LOG = "/opt/trader-agent/scripts/alerts_log.jsonl"
 
 # Trailing Stop Configuration
-TRAILING_TRIGGER_PROFIT = 50.0    # Trigger trailing stop when unrealized P&L >= $50
-TRAILING_SL_BE_PROFIT = 100.0     # Move SL to breakeven when P&L >= $100, then trail from BE
-TRAILING_DISTANCE_DOLLARS = 50.0  # Trail distance in dollars (0.25R)
-TRAILING_CHECK_INTERVAL = 30       # Check positions every 30 seconds
+TRAILING_SL_BE_PROFIT = 80.0         # Move SL to breakeven when P&L >= $80
 
 # Gzip decompression + JSON fix middleware
 @app.middleware("http")
@@ -233,23 +230,21 @@ MIN_RISK_REWARD = 1.5             # Min R:R for entry
 MAX_HOLD_TIME_MINUTES = 45        # Max time a trade can be open (5m scalping)
 MAX_SL_OVERSHOOT_PCT = 20         # Max % over $125 risk at SL (min lot basis): 150 = reject
 
-# Take Profit Configuration (based on swing analysis P70 percentiles)
-# Format: {symbol: {tp1_dollars, tp2_dollars, use_trail_after_tp1}}
-# TP1 = $200 for indices (wide spreads eat profits on tight TPs), $300 for others
-# TP2 = Swing P70 target for symbols with R:R > 2.0, else trail only
+# Take Profit Configuration
+# TP1 = $100 for all symbols
 TP_CONFIG = {
-    "US30.R":     {"tp1_dollars": 200, "tp2_dollars": None, "trail_after_tp1": True},
-    "NAS100.R":   {"tp1_dollars": 200, "tp2_dollars": None, "trail_after_tp1": True},
-    "SPX500.R":   {"tp1_dollars": 200, "tp2_dollars": None, "trail_after_tp1": False},
-    "XAUUSD.R":   {"tp1_dollars": 200, "tp2_dollars": None, "trail_after_tp1": False},
-    "XPDUSD.R":   {"tp1_dollars": 200, "tp2_dollars": None, "trail_after_tp1": False},
-    "UKOIL.R":    {"tp1_dollars": 200, "tp2_dollars": None, "trail_after_tp1": False},
-    "LVMH":       {"tp1_dollars": 200, "tp2_dollars": None, "trail_after_tp1": True},
-    "SIEMENS":    {"tp1_dollars": 200, "tp2_dollars": None, "trail_after_tp1": True},
-    "ALPHABET-C": {"tp1_dollars": 200, "tp2_dollars": None, "trail_after_tp1": True},
-    "GE":         {"tp1_dollars": 200, "tp2_dollars": None, "trail_after_tp1": True},
-    "GBPJPY.R":   {"tp1_dollars": 200, "tp2_dollars": None, "trail_after_tp1": True},
-    "USDJPY.R":   {"tp1_dollars": 200, "tp2_dollars": None, "trail_after_tp1": True},
+    "US30.R":     {"tp1_dollars": 100, "tp2_dollars": None, "trail_after_tp1": True},
+    "NAS100.R":   {"tp1_dollars": 100, "tp2_dollars": None, "trail_after_tp1": True},
+    "SPX500.R":   {"tp1_dollars": 100, "tp2_dollars": None, "trail_after_tp1": False},
+    "XAUUSD.R":   {"tp1_dollars": 100, "tp2_dollars": None, "trail_after_tp1": False},
+    "XPDUSD.R":   {"tp1_dollars": 100, "tp2_dollars": None, "trail_after_tp1": False},
+    "UKOIL.R":    {"tp1_dollars": 100, "tp2_dollars": None, "trail_after_tp1": False},
+    "LVMH":       {"tp1_dollars": 100, "tp2_dollars": None, "trail_after_tp1": True},
+    "SIEMENS":    {"tp1_dollars": 100, "tp2_dollars": None, "trail_after_tp1": True},
+    "ALPHABET-C": {"tp1_dollars": 100, "tp2_dollars": None, "trail_after_tp1": True},
+    "GE":         {"tp1_dollars": 100, "tp2_dollars": None, "trail_after_tp1": True},
+    "GBPJPY.R":   {"tp1_dollars": 100, "tp2_dollars": None, "trail_after_tp1": True},
+    "USDJPY.R":   {"tp1_dollars": 100, "tp2_dollars": None, "trail_after_tp1": True},
 }
 
 # Session time ranges (ET)
@@ -594,28 +589,28 @@ def get_technical_summary(tl_symbol: str) -> str:
 # TRAILING STOP BACKGROUND TASK
 # =============================================================================
 
-# Track positions that already have trailing stops applied
-_trailing_active_positions: set[int] = set()
+# Track positions that already have breakeven SL applied
+_be_applied_positions: set[int] = set()
 
 async def check_and_apply_trailing_stops():
-    """Background task: check open positions and apply trailing stops when profitable."""
-    global _trailing_active_positions
-    
+    """Background task: move SL to breakeven when profitable."""
+    global _be_applied_positions
+
     try:
         positions_df = tl.get_all_positions()
         if positions_df is None or positions_df.empty:
             return
-        
+
         for _, pos in positions_df.iterrows():
             position_id = int(pos.get("id", 0))
             unrealized_pl = float(pos.get("unrealizedPl", 0.0))
-            qty = float(pos.get("qty", 0.0))
-            side = pos.get("side", "")
             avg_price = float(pos.get("avgPrice", 0.0))
             instrument_id = int(pos.get("tradableInstrumentId", 0))
-            
-            # Phase 2: P&L >= $100 → move SL to BE then trail
+
             if unrealized_pl >= TRAILING_SL_BE_PROFIT:
+                if position_id in _be_applied_positions:
+                    continue
+
                 try:
                     modification_params = {
                         "stopLossType": "absolute",
@@ -623,53 +618,15 @@ async def check_and_apply_trailing_stops():
                     }
                     success = tl.modify_position(position_id, modification_params)
                     if success:
-                        _trailing_active_positions.discard(position_id)
-                        print(f"[TRAILING BE] Position {position_id}: SL moved to BE @{avg_price}, P&L=${unrealized_pl:.2f}")
-                        # Re-apply trailing from BE in next check cycle
+                        _be_applied_positions.add(position_id)
+                        print(f"[BE SL] Position {position_id}: SL moved to BE @{avg_price}, P&L=${unrealized_pl:.2f}", flush=True)
                     else:
-                        print(f"[TRAILING BE] Failed to move SL to BE for position {position_id}")
+                        print(f"[BE SL] Failed to move SL to BE for position {position_id}", flush=True)
                 except Exception as e:
-                    print(f"[TRAILING BE] Error for position {position_id}: {e}")
-                continue
-            
-            # Phase 1: P&L >= $50 → apply trailing stop
-            if unrealized_pl >= TRAILING_TRIGGER_PROFIT:
-                if position_id in _trailing_active_positions:
-                    continue
-                
-                try:
-                    symbol_config = None
-                    for sym, cfg in TOP_SYMBOLS.items():
-                        if tl.get_instrument_id_from_symbol_name(sym) == instrument_id:
-                            symbol_config = cfg
-                            break
-                    
-                    if symbol_config is None:
-                        continue
-                    
-                    point_value = get_point_value(sym)
-                    trail_distance_price = TRAILING_DISTANCE_DOLLARS / (abs(qty) * point_value)
-                    
-                    tick_size = symbol_config.get("tick_size", 0.01)
-                    trail_distance_price = round(trail_distance_price / tick_size) * tick_size
-                    
-                    modification_params = {
-                        "stopLossType": "trailingOffset",
-                        "stopLoss": trail_distance_price
-                    }
-                    
-                    success = tl.modify_position(position_id, modification_params)
-                    if success:
-                        _trailing_active_positions.add(position_id)
-                        print(f"[TRAILING STOP] Applied to position {position_id}: trail=${TRAILING_DISTANCE_DOLLARS} ({trail_distance_price:.5f}), P&L=${unrealized_pl:.2f}")
-                    else:
-                        print(f"[TRAILING STOP] Failed for position {position_id}")
-                        
-                except Exception as e:
-                    print(f"[TRAILING STOP] Error for position {position_id}: {e}")
-                    
+                    print(f"[BE SL] Error for position {position_id}: {e}", flush=True)
+
     except Exception as e:
-        print(f"[TRAILING STOP] Background task error: {e}")
+        print(f"[BE SL] Background task error: {e}", flush=True)
 
 
 async def check_and_close_overdue_positions():
@@ -744,17 +701,17 @@ async def check_and_close_overdue_positions():
 # Start background task on startup
 @app.on_event("startup")
 async def start_trailing_stop_monitor():
-    """Start the trailing stop monitoring background task."""
+    """Start the breakeven SL monitoring background task."""
     import asyncio
     
-    async def trailing_loop():
+    async def be_check_loop():
         while True:
-            await asyncio.sleep(TRAILING_CHECK_INTERVAL)
+            await asyncio.sleep(30)
             await check_and_apply_trailing_stops()
             await check_and_close_overdue_positions()
 
-    asyncio.create_task(trailing_loop())
-    print(f"[TRAILING STOP] Monitor started: trigger=${TRAILING_TRIGGER_PROFIT}→BE=${TRAILING_SL_BE_PROFIT}, trail=${TRAILING_DISTANCE_DOLLARS}, interval={TRAILING_CHECK_INTERVAL}s")
+    asyncio.create_task(be_check_loop())
+    print(f"[BE SL] Monitor started: trigger=${TRAILING_SL_BE_PROFIT}, interval=30s", flush=True)
     print(f"[OVERDUE] Position age limit={MAX_HOLD_TIME_MINUTES}min", flush=True)
 
 @app.post("/webhook")
@@ -1047,11 +1004,11 @@ async def get_status():
 
 @app.get("/trailing-status")
 async def get_trailing_status():
-    """Get trailing stop status for all open positions."""
+    """Get breakeven SL status for all open positions."""
     try:
         positions_df = tl.get_all_positions()
         if positions_df is None or positions_df.empty:
-            return {"trailing_active": [], "positions": []}
+            return {"be_sl_active": [], "positions": []}
         
         positions = []
         for _, pos in positions_df.iterrows():
@@ -1076,13 +1033,12 @@ async def get_trailing_status():
                 "qty": qty,
                 "avg_price": avg_price,
                 "unrealized_pl": unrealized_pl,
-                "trailing_active": position_id in _trailing_active_positions,
-                "trigger_threshold": TRAILING_TRIGGER_PROFIT,
-                "trail_distance": TRAILING_DISTANCE_DOLLARS
+                "be_sl_applied": position_id in _be_applied_positions,
+                "be_trigger": TRAILING_SL_BE_PROFIT
             })
         
         return {
-            "trailing_active": [p["position_id"] for p in positions if p["trailing_active"]],
+            "be_sl_active": [p["position_id"] for p in positions if p["be_sl_applied"]],
             "positions": positions
         }
     except Exception as e:
