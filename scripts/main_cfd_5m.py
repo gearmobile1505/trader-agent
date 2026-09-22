@@ -910,16 +910,25 @@ Evaluate this trade for a 5M scalping prop challenge. Output ONLY valid JSON: {{
         log_alert(data, result)
         return result
     
-    # Parse Ollama JSON response
+    # Parse Ollama JSON response (handles plain JSON and markdown-wrapped)
+    import re
+    decision = "DENY"
+    confidence = 0.0
     try:
-        import json as json_parse
-        ai_response = json_parse.loads(agent_decision.strip())
-        decision = ai_response.get("decision", "").upper()
-        confidence = ai_response.get("confidence", 0.0)
-    except (json_parse.JSONDecodeError, AttributeError):
-        # Fallback: check for ALLOW/APPROVE in text response
-        decision = "ALLOW" if "ALLOW" in agent_decision.upper() or "APPROVED" in agent_decision.upper() else "DENY"
-        confidence = 0.0
+        text = agent_decision.strip()
+        # Extract JSON from markdown code blocks if present
+        json_match = re.search(r'\{.*\}', text, re.DOTALL)
+        if json_match:
+            ai_response = json.loads(json_match.group(0))
+            decision = ai_response.get("decision", "").upper()
+            confidence = ai_response.get("confidence", 0.0)
+        elif "ALLOW" in text.upper():
+            decision = "ALLOW"
+        elif "APPROVED" in text.upper():
+            decision = "ALLOW"
+    except Exception as exc:
+        print(f"[AI] JSON parse failed: {exc}, defaulting to DENY", flush=True)
+        decision = "DENY"
 
     if decision == "ALLOW":
         try:
