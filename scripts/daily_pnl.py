@@ -242,7 +242,7 @@ def get_daily_pnl(target_date: datetime = None):
     print(f"  Open Positions: {len(open_trades)}")
     
     # Daily limit check
-    DAILY_LOSS_LIMIT = 500
+    DAILY_LOSS_LIMIT = 400
     if total_pnl <= -DAILY_LOSS_LIMIT:
         print(f"\n⚠️  DAILY LOSS LIMIT HIT: ${total_pnl:.2f} <= -${DAILY_LOSS_LIMIT}")
         print("   Stop trading for the day!")

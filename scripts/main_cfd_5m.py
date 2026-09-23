@@ -309,8 +309,31 @@ def map_symbol(tv_symbol: str) -> str:
     base = tv_symbol.replace("1!", "").replace("!", "").upper()
     return SYMBOL_MAP.get(base, tv_symbol)
 
+# Cache for get_all_positions to prevent TradeLocker API hammering
+_POSITIONS_CACHE: dict = {"data": None, "expires_at": 0.0}
+_POSITIONS_CACHE_TTL = 30.0
+
+
+def get_cached_positions():
+    """Return cached positions if fresh, otherwise fetch from broker."""
+    now = datetime.now().timestamp()
+    cached = _POSITIONS_CACHE.get("data")
+    expires = _POSITIONS_CACHE.get("expires_at", 0.0)
+    if cached is not None and now < expires:
+        return cached
+    try:
+        positions = tl.get_all_positions()
+        _POSITIONS_CACHE["data"] = positions
+        _POSITIONS_CACHE["expires_at"] = now + _POSITIONS_CACHE_TTL
+        return positions
+    except Exception as exc:
+        print(f"[POS CACHE] Fetch failed: {exc}", flush=True)
+        return cached if cached is not None else pd.DataFrame()
+
+# Cache for JPY point value (USDJPY rate)
 _JPY_PV_CACHE: dict = {"value": None, "expires_at": 0.0}
 _JPY_PV_TTL = 60.0
+
 
 def get_point_value(tl_symbol: str) -> float:
     """Get the USD value of a one-price-unit move for one lot.
@@ -661,7 +684,7 @@ async def check_and_apply_trailing_stops(positions_df=None):
     global _be_applied_positions
 
     if positions_df is None:
-        positions_df = tl.get_all_positions()
+        positions_df = get_cached_positions()
     try:
         if positions_df is None or positions_df.empty:
             return
@@ -701,7 +724,7 @@ async def check_and_close_overdue_positions(positions_df=None):
     positions where the SL/trailing mechanism failed to trigger.
     """
     if positions_df is None:
-        positions_df = tl.get_all_positions()
+        positions_df = get_cached_positions()
     try:
         if positions_df is None or positions_df.empty:
             return
@@ -775,7 +798,7 @@ async def start_trailing_stop_monitor():
         while True:
             await asyncio.sleep(monitor_interval)
             try:
-                positions_df = tl.get_all_positions()
+                positions_df = get_cached_positions()
             except Exception as exc:
                 monitor_interval = min(
                     monitor_interval * 2,
@@ -974,7 +997,7 @@ def process_tradingview_alert(data: dict, task_id: str):
 
     # Check max concurrent positions
     try:
-        positions_df = tl.get_all_positions()
+        positions_df = get_cached_positions()
         if positions_df is not None and len(positions_df) >= MAX_OPEN_TRADES:
             result = {"status": "rejected", "reason": f"Max {MAX_OPEN_TRADES} concurrent positions reached"}
             log_alert(data, result)
@@ -1007,9 +1030,9 @@ Evaluate this trade for a 5M scalping prop challenge. Output ONLY valid JSON: {{
         return result
     
     # Parse Ollama JSON response (handles plain JSON, markdown-wrapped, multi-block)
-        decision = "DENY"
-        confidence = 0.0
-        reason = "no reason provided"
+    decision = "DENY"
+    confidence = 0.0
+    reason = "no reason provided"
     try:
         text = agent_decision.strip()
         # Find all potential JSON objects (non-greedy)
@@ -1170,7 +1193,7 @@ async def get_status():
 async def get_trailing_status():
     """Get breakeven SL status for all open positions."""
     try:
-        positions_df = tl.get_all_positions()
+        positions_df = get_cached_positions()
         if positions_df is None or positions_df.empty:
             return {"be_sl_active": [], "positions": []}
         

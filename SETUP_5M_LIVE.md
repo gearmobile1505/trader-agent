@@ -217,12 +217,12 @@ Based on typical prop firm offerings (Forex, Commodities, Indices, Crypto), here
 ### Risk Parameters (in `main_cfd_5m.py`)
 | Parameter | Value |
 |-----------|-------|
-| Risk per Trade | $125 |
+| Risk per Trade | $100 |
 | Max Daily Loss | $400 |
 | Max Open Trades | 3 |
 | Min Risk:Reward | 1.5 |
-| Position Sizing | Dynamic ($125 / SL_distance × point_value), capped at max_lot per symbol |
-| Max Lot | GBPJPY.R: 0.20, USDJPY.R: 0.30, others: 1.00 |
+| Position Sizing | Dynamic ($100 / SL_distance × point_value), capped at max_lot per symbol |
+| Max Lot | GBPJPY.R: 0.30, USDJPY.R: 0.30, others: 1.00 |
 | Stop Loss | Phantom Shift Band (ATR-based) |
 | Technical Summary | Computed live: EMA(9/21), SMA(50), RSI(14), MACD, ADX, Williams %R → Strong Buy/Buy/Neutral/Sell/Strong Sell. Fed to AI as directional bias check. Contradicting signals noted as risk factor. |
 
@@ -238,14 +238,14 @@ Based on typical prop firm offerings (Forex, Commodities, Indices, Crypto), here
 ### Approved Symbols (Whitelisted)
 ```python
 TOP_SYMBOLS = {
-    "LVMH":        {"point_value": 1.0,  "min_lot": 0.01, "sessions": ["EU"]},
-    "XPDUSD.R":    {"point_value": 1.0,  "min_lot": 0.01, "sessions": ["EU", "NY"]},
-    "ALPHABET-C":  {"point_value": 1.0,  "min_lot": 0.01, "sessions": ["NY"]},
-    "UKOIL.R":     {"point_value": 10.0, "min_lot": 0.01, "sessions": ["ASIA", "EU", "NY"]},
-    "SIEMENS":     {"point_value": 1.0,  "min_lot": 0.01, "sessions": ["EU"]},
-    "GE":          {"point_value": 1.0,  "min_lot": 0.01, "sessions": ["NY"]},
-    "GBPJPY.R":    {"point_value": 3000.0,  "min_lot": 0.01, "sessions": ["ASIA", "EU", "NY", "NY_EARLY"]},
-    "USDJPY.R":    {"point_value": 3000.0,  "min_lot": 0.01, "sessions": ["ASIA", "EU", "NY", "NY_EARLY"]},
+    "LVMH":        {"point_value": 100.0,  "min_lot": 0.01, "sessions": ["EU"]},
+    "XPDUSD.R":    {"point_value": 100.0,  "min_lot": 0.01, "sessions": ["EU", "NY"]},
+    "ALPHABET-C":  {"point_value": 100.0,  "min_lot": 0.01, "sessions": ["NY"]},
+    "UKOIL.R":     {"point_value": 1000.0, "min_lot": 0.01, "sessions": ["ASIA", "EU", "NY"]},
+    "SIEMENS":     {"point_value": 100.0,  "min_lot": 0.01, "sessions": ["EU"]},
+    "GE":          {"point_value": 100.0,  "min_lot": 0.01, "sessions": ["NY"]},
+    "GBPJPY.R":    {"point_value": 100000.0, "point_value_currency": "JPY", "fallback_point_value": 650.0, "min_lot": 0.01, "max_lot": 0.30, "sessions": ["NY", "EU", "ASIA", "NY_EARLY"]},
+    "USDJPY.R":    {"point_value": 100000.0, "point_value_currency": "JPY", "fallback_point_value": 650.0, "min_lot": 0.01, "max_lot": 0.30, "sessions": ["NY", "EU", "ASIA", "NY_EARLY"]},
 }
 ```
 
