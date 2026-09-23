@@ -311,7 +311,7 @@ def map_symbol(tv_symbol: str) -> str:
 
 # Cache for get_all_positions to prevent TradeLocker API hammering
 _POSITIONS_CACHE: dict = {"data": None, "expires_at": 0.0}
-_POSITIONS_CACHE_TTL = 30.0
+_POSITIONS_CACHE_TTL = 120.0
 
 
 def get_cached_positions():
