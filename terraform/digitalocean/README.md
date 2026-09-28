@@ -2,6 +2,8 @@
 
 Deploys a production-ready trading webhook server on DigitalOcean.
 
+> **See [`deploy/MIGRATION_PLAN.md`](../../deploy/MIGRATION_PLAN.md)** for the single-document migration plan: the sizing decision (4 GB with Ollama is OOM-exposed), the recommended $6 Option B architecture, the code and infrastructure changes, the six-phase rollout with gates, the runbook, rollback, and troubleshooting. This file documents the IaC only.
+
 ## Architecture
 
 ```

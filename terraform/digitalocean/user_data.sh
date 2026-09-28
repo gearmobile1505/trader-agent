@@ -2,8 +2,8 @@
 
 echo "=== Starting trader-agent setup at $(date) ==="
 
-# Create swap file before anything else (Ollama needs it)
-fallocate -l 8G /swapfile 2>/dev/null
+# Create swap file before anything else (1 GB box needs it)
+fallocate -l 4G /swapfile 2>/dev/null
 chmod 600 /swapfile 2>/dev/null
 mkswap /swapfile 2>/dev/null
 swapon /swapfile 2>/dev/null
@@ -13,17 +13,12 @@ echo '/swapfile none swap sw 0 0' >> /etc/fstab 2>/dev/null
 apt-get update && apt-get upgrade -y
 
 # Install dependencies
+# NOTE: no Ollama. The AI risk review is delegated to a cloud API, so there is
+# no model to download and no ~2.3 GB of weights to pin on a 25 GB disk.
 apt-get install -y \
     python3 python3-pip python3-venv \
     git curl wget \
     postgresql-client
-
-# Install Ollama
-curl -fsSL https://ollama.com/install.sh | sh
-
-# Start Ollama service
-systemctl enable ollama
-systemctl start ollama
 
 # Create trader user
 useradd -m -s /bin/bash trader
@@ -47,17 +42,36 @@ TL_ENV=https://demo.tradelocker.com
 TL_USER=${tradelocker_email}
 TL_PASS=${tradelocker_password}
 TL_SERVER=${tradelocker_server}
+AI_PROVIDER=${ai_provider}
+AI_FAIL_OPEN=${ai_fail_open}
+CLOUD_API_URL=${cloud_api_url}
+CLOUD_API_KEY=${cloud_api_key}
+CLOUD_API_MODEL=${cloud_api_model}
+AI_MODEL=${ollama_model}
+AI_TIMEOUT_SECONDS=15
+AI_MAX_CONCURRENCY=2
+AI_QUEUE_TIMEOUT_SECONDS=30
+AI_MAX_PREDICT=96
 ENVEOF
 
 chown trader:trader /opt/trader-agent/.env
 chmod 600 /opt/trader-agent/.env
 
+# Health monitor: memory, OOM and AI backend checks every 5 minutes
+cat > /etc/cron.d/trader-health << 'CRON_EOF'
+*/5 * * * * trader /opt/trader-agent/venv/bin/python3 /opt/trader-agent/scripts/monitor_health.py >/dev/null 2>&1
+CRON_EOF
+chmod 644 /etc/cron.d/trader-health
+
 # Create systemd service
+# No Requires=ollama.service: the receiver must serve /health even when the AI
+# backend is unreachable. Provider failure is handled in-process by the
+# configured fail policy (AI_FAIL_OPEN).
 cat > /etc/systemd/system/trader-agent.service << 'SVC_EOF'
 [Unit]
 Description=Trader Agent Webhook Server
-After=network.target ollama.service
-Requires=ollama.service
+After=network-online.target
+Wants=network-online.target
 
 [Service]
 Type=simple
@@ -74,14 +88,16 @@ StandardError=journal
 SyslogIdentifier=trader-agent
 
 LimitNOFILE=65536
-MemoryMax=3G
+MemoryMax=700M
 CPUQuota=200%
 
 [Install]
 WantedBy=multi-user.target
 SVC_EOF
 
-# Configure Cloudflare Tunnel directly to FastAPI port 8000
+# Cloudflare named tunnel (stable URL across restarts).
+# /etc/cloudflared/config.yml must already exist — see CLOUDFLARE_TUNNEL_SETUP.md.
+# cloudflared dials out, so no inbound port needs to be open.
 cat > /etc/systemd/system/cloudflared.service << 'CLOUD_EOF'
 [Unit]
 Description=Cloudflare Tunnel
@@ -91,7 +107,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 User=root
-ExecStart=/usr/local/bin/cloudflared tunnel --url http://localhost:8000 --no-prechecks
+ExecStart=/usr/local/bin/cloudflared tunnel --no-autoupdate run trader-agent
 Restart=always
 RestartSec=30
 
@@ -103,17 +119,22 @@ systemctl daemon-reload
 systemctl enable cloudflared
 systemctl restart cloudflared
 
-# Wait for Ollama to be ready and pull model
-sleep 15
-ollama pull ${ollama_model}
-
 # Start the service
 systemctl start trader-agent
 
-# Wait for service to be ready
-sleep 5
-curl -sf http://localhost:8000/status > /dev/null 2>&1 && echo "Service healthy" || echo "Service not healthy yet"
+# Wait for the service to answer, then report health explicitly.
+# A bare curl either passes or is silently ignored; the retry loop tells you which.
+for i in $(seq 1 20); do
+  if curl -fsS http://127.0.0.1:8000/health > /dev/null 2>&1; then
+    echo "Service healthy after $i seconds"
+    break
+  fi
+  sleep 1
+done
+
+curl -fsS http://127.0.0.1:8000/health | python3 -m json.tool || echo "WARNING: /health did not respond"
 
 echo "=== Setup completed at $(date) ==="
-echo "Webhook URL: https://YOUR_TUNNEL_URL.trycloudflare.com/webhook"
-echo "Status: https://YOUR_TUNNEL_URL.trycloudflare.com/status"
+echo "Local status:  http://127.0.0.1:8000/health"
+echo "Public status: https://<your-tunnel-hostname>/health"
+echo "Webhook URL:   https://<your-tunnel-hostname>/webhook"

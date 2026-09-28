@@ -1,44 +1,53 @@
 output "droplet_ip" {
-  description = "Public IPv4 address of the main droplet"
-  value       = digitalocean_droplet.trading_bot.ipv4_address
-}
-
-output "droplet_ipv6" {
-  description = "Public IPv6 address of the droplet"
-  value       = digitalocean_droplet.trading_bot.ipv6_address
+  description = "Public IPv4 of the new Option B droplet"
+  value       = digitalocean_droplet.new_architecture.ipv4_address
 }
 
 output "droplet_name" {
-  description = "Name of the droplet"
-  value       = digitalocean_droplet.trading_bot.name
+  description = "Name of the new Option B droplet"
+  value       = digitalocean_droplet.new_architecture.name
 }
 
-output "ssh_command" {
-  description = "SSH command to connect to the droplet"
-  value       = "ssh root@${digitalocean_droplet.trading_bot.ipv4_address}"
+output "new_ssh_command" {
+  description = "SSH into the new Option B droplet"
+  value       = "ssh root@${digitalocean_droplet.new_architecture.ipv4_address}"
 }
 
-output "webhook_url" {
-  description = "Webhook URL for TradingView alerts"
-  value       = var.domain_name != "" ? "https://webhook.${var.domain_name}/webhook" : "http://${digitalocean_droplet.trading_bot.ipv4_address}:8000/webhook"
+output "existing_prod_ip" {
+  description = "Public IPv4 of the existing live server (read-only in Terraform)"
+  value       = digitalocean_droplet.existing_prod.ipv4_address
 }
 
-output "api_url" {
-  description = "API base URL"
-  value       = var.domain_name != "" ? "https://api.${var.domain_name}" : "http://${digitalocean_droplet.trading_bot.ipv4_address}:8000"
+output "existing_prod_ssh_command" {
+  description = "SSH into the existing live server"
+  value       = "ssh root@${digitalocean_droplet.existing_prod.ipv4_address}"
 }
 
-output "firewall_name" {
-  description = "Name of the firewall"
-  value       = digitalocean_firewall.trading_firewall.name
+output "public_health_url" {
+  description = "Public health endpoint once the named tunnel is live"
+  value       = "https://${var.domain_name}/health"
+}
+
+output "public_webhook_url" {
+  description = "TradingView webhook URL once the named tunnel is live"
+  value       = "https://${var.domain_name}/webhook"
+}
+
+output "ai_backend" {
+  description = "Which AI layer is configured (no secrets)"
+  value       = "${var.ai_provider}:${var.cloud_api_model}"
 }
 
 output "estimated_monthly_cost_usd" {
   description = "Estimated monthly cost in USD"
-  value = (var.droplet_size == "s-1vcpu-1gb" ? 6
-    : var.droplet_size == "s-1vcpu-2gb" ? 12
-    : var.droplet_size == "s-2vcpu-2gb" ? 18
-    : var.droplet_size == "s-2vcpu-4gb" ? 24
-    : var.droplet_size == "s-4vcpu-8gb" ? 48
-  : 24)
+  value = (
+    # New Option B droplet
+    (var.droplet_size == "s-1vcpu-1gb" ? 6
+      : var.droplet_size == "s-1vcpu-2gb" ? 12
+      : var.droplet_size == "s-2vcpu-2gb" ? 18
+      : var.droplet_size == "s-2vcpu-4gb" ? 24
+    : 48)
+    # Existing live droplet, still running until cutover
+    + 24
+  )
 }

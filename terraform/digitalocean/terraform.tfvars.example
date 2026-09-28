@@ -1,21 +1,39 @@
 # DigitalOcean Terraform Variables
-# Copy this file to terraform.tfvars and fill in your values
+# Copy to terraform.tfvars and fill in. terraform.tfvars is gitignored — never commit it.
 
 do_token           = "your_digitalocean_pat_here"
 ssh_fingerprint    = "your_ssh_key_fingerprint_here"
 project_name       = "trader-agent"
 environment        = "prod"
 region             = "nyc3"
-droplet_size       = "s-2vcpu-4gb"
-domain_name        = ""  # e.g., "yourdomain.com" (optional)
+
+# Option B sizing: 1 GB, no local Ollama.
+# Changing this forces a droplet replacement (new IP unless a reserved IP is attached).
+droplet_size       = "s-1vcpu-1gb"
+
+# DNS is managed by Cloudflare (named tunnel), not DigitalOcean.
+# Used for the output URLs only; no digitalocean_domain/record resources exist.
+domain_name        = "cello1505.com"
 
 # TradeLocker credentials
 tradelocker_email    = "your_email@example.com"
 tradelocker_password = "your_password_here"
 tradelocker_server   = "GATESFX"
 
+# AI layer (Option B)
+ai_provider     = "cloud"
+cloud_api_url   = "https://api.deepseek.com/chat/completions"
+cloud_api_key   = "your_api_key_here"
+cloud_api_model = "deepseek-chat"
+
+# 0 = deny trades when the AI backend is unavailable (prop-account safe)
+# 1 = treat a backend outage as an approval
+ai_fail_open    = "0"
+
+# Only used when ai_provider = "ollama" (local fallback)
+ollama_model              = "phi3:mini"
+
 # Trading parameters
-ollama_model              = "llama3"
-risk_per_trade            = 125
+risk_per_trade            = 200
 daily_loss_limit          = 400
 max_concurrent_positions  = 3

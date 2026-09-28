@@ -38,9 +38,9 @@ variable "region" {
 }
 
 variable "droplet_size" {
-  description = "Droplet size slug"
+  description = "Droplet size slug. Option B uses s-1vcpu-1gb (no local Ollama)."
   type        = string
-  default     = "s-2vcpu-4gb"
+  default     = "s-1vcpu-1gb"
   validation {
     condition     = contains(["s-1vcpu-1gb", "s-1vcpu-2gb", "s-2vcpu-2gb", "s-2vcpu-4gb", "s-4vcpu-8gb"], var.droplet_size)
     error_message = "Invalid size. Choose from: s-1vcpu-1gb, s-1vcpu-2gb, s-2vcpu-2gb, s-2vcpu-4gb, s-4vcpu-8gb"
@@ -72,9 +72,48 @@ variable "tradelocker_server" {
 }
 
 variable "ollama_model" {
-  description = "Ollama model to use"
+  description = "Ollama model tag. Only used when ai_provider = ollama (local fallback, not Option B)"
   type        = string
   default     = "phi3:mini"
+}
+
+variable "ai_provider" {
+  description = "AI backend: cloud = OpenAI-compatible API (Option B), ollama = local model"
+  type        = string
+  default     = "cloud"
+  validation {
+    condition     = contains(["cloud", "ollama"], var.ai_provider)
+    error_message = "ai_provider must be cloud or ollama"
+  }
+}
+
+variable "ai_fail_open" {
+  description = "1 = execute trades when the AI backend is unavailable, 0 = deny. 0 is safer for prop accounts."
+  type        = string
+  default     = "0"
+  validation {
+    condition     = contains(["0", "1"], var.ai_fail_open)
+    error_message = "ai_fail_open must be \"0\" or \"1\""
+  }
+}
+
+variable "cloud_api_url" {
+  description = "OpenAI-compatible chat completions endpoint, full path. Required when ai_provider = cloud."
+  type        = string
+  default     = ""
+}
+
+variable "cloud_api_key" {
+  description = "API key for the cloud AI provider. Written only to the droplet .env (mode 600)."
+  type        = string
+  sensitive   = true
+  default     = ""
+}
+
+variable "cloud_api_model" {
+  description = "Model name for the cloud AI provider"
+  type        = string
+  default     = "deepseek-chat"
 }
 
 variable "risk_per_trade" {
