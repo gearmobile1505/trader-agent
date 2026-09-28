@@ -17,8 +17,30 @@ apt-get update && apt-get upgrade -y
 # no model to download and no ~2.3 GB of weights to pin on a 25 GB disk.
 apt-get install -y \
     python3 python3-pip python3-venv \
+    software-properties-common \
     git curl wget \
     postgresql-client
+
+# tradelocker>=0.56 requires Python >=3.11. Ubuntu 22.04 ships 3.10, so pull
+# 3.12 from deadsnakes and build the venv with it.
+if ! command -v python3.12 > /dev/null 2>&1; then
+    add-apt-repository -y ppa:deadsnakes/ppa
+    apt-get update
+    apt-get install -y python3.12 python3.12-venv python3.12-dev
+fi
+PYTHON_BIN=python3.12
+
+# Fix journald so `journalctl` actually returns something.
+# Container images often ship /var/log/journal/<machine-id> for the *build*
+# machine, so journald finds no journal for this host and every journalctl
+# call is a silent no-op. That breaks service log inspection and the OOM
+# detection in monitor_health.py.
+mkdir -p /etc/systemd/journald.conf.d
+printf '[Journal]\nStorage=persistent\n' > /etc/systemd/journald.conf.d/persistent.conf
+mkdir -p "/var/log/journal/$(cat /etc/machine-id)"
+chown root:systemd-journal "/var/log/journal/$(cat /etc/machine-id)"
+chmod 2755 "/var/log/journal/$(cat /etc/machine-id)"
+systemctl restart systemd-journald
 
 # Create trader user
 useradd -m -s /bin/bash trader
@@ -30,7 +52,7 @@ rm -rf /opt/trader-agent
 sudo -u trader git clone https://github.com/gearmobile1505/trader-agent.git /opt/trader-agent
 
 # Create Python virtual environment
-sudo -u trader python3 -m venv /opt/trader-agent/venv
+sudo -u trader $PYTHON_BIN -m venv /opt/trader-agent/venv
 sudo -u trader /opt/trader-agent/venv/bin/pip install --upgrade pip
 
 # Install Python dependencies from repo

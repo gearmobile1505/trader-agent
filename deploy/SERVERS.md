@@ -40,11 +40,37 @@ so the tunnel uses the `webhook.` subdomain.
 - Stopped `friendly_pike` cloudflared container
 - Terraform `digitalocean_domain` / `digitalocean_record` for DO-managed DNS
 
+## Operations
+
+```bash
+ssh root@138.197.8.50
+
+# decision log (one JSON object per line: alert + result)
+cat /opt/trader-agent/scripts/alerts_log.jsonl | tail -1 | python3 -m json.tool
+tail -f /opt/trader-agent/scripts/alerts_log.jsonl
+
+# service logs
+journalctl -u trader-agent -f
+journalctl -u trader-agent -p err --since -1h
+
+# health
+curl -s http://127.0.0.1:8000/health | python3 -m json.tool
+
+# monitor alerts (only writes when something is wrong)
+cat /opt/trader-agent/scripts/health_monitor.log
+
+systemctl restart trader-agent
+```
+
+Docker is still installed but idle (0 containers, ~0 MB). Juice Shop is gone. Stop it to reclaim a
+little memory on a 1 GB box: `systemctl stop docker && systemctl disable docker`.
+
 ## Known issues
 
-- The droplet runs Ubuntu 22.04, so `tradelocker==0.56.0` (needs py>=3.11) required installing
-  Python 3.12 from deadsnakes. `user_data.sh` does not do this yet — add it before any fresh
-  droplet is created from this config.
+- **SSH is firewalled to two IPs** (`174.209.193.129`, `73.106.218.36`). If your home IP changes you
+  lose SSH and must use the DigitalOcean console to recover, or widen the rule.
+- `webhook.cello1505.com/webhook` has no authentication (pre-existing).
+- Old server 143.198.7.200 has no firewall applied at all.
 - Script fixes are **not committed**. The droplet got them via scp; a `git pull` on the server
   would not have them. Commit before relying on the repo as source of truth.
 - `webhook.cello1505.com/webhook` has no authentication (pre-existing).
