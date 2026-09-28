@@ -9,21 +9,68 @@ import os
 import json
 import gzip
 import re
+import sys
 import asyncio
+import threading
 from uuid import uuid4
 from datetime import datetime, timedelta
 from fastapi import FastAPI, Request
-import ollama
 import pandas as pd
 from tradelocker import TLAPI
 from dotenv import load_dotenv
 
 load_dotenv()
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import ai_decider
+
 app = FastAPI()
 
 # Alert log file
 ALERT_LOG = "/opt/trader-agent/scripts/alerts_log.jsonl"
+
+# AI Evaluation Configuration
+# Bound concurrent AI calls: the default asyncio thread executor allows
+# cpu_count + 4 workers, and on a 1 GB droplet an alert burst must not pin
+# every thread on a provider call.
+AI_MAX_CONCURRENCY = int(os.getenv("AI_MAX_CONCURRENCY", "2"))
+AI_QUEUE_TIMEOUT_SECONDS = float(os.getenv("AI_QUEUE_TIMEOUT_SECONDS", "30"))
+# 0 = deny trades when the AI backend is unavailable (prop-account safe)
+# 1 = treat a backend outage as an approval
+AI_FAIL_OPEN = os.getenv("AI_FAIL_OPEN", "0") == "1"
+
+_AI_GATE = threading.Semaphore(AI_MAX_CONCURRENCY)
+
+_AI_STATE = {
+    "decisions": 0,
+    "failures": 0,
+    "last_error": None,
+    "last_latency_ms": None,
+    "last_decision": None,
+    "last_source": None,
+    "last_decision_at": None,
+}
+
+
+def _ai_reset_stats() -> None:
+    """Counters describe this process, not the previous one."""
+    _AI_STATE.update({
+        "decisions": 0,
+        "failures": 0,
+        "last_error": None,
+        "last_latency_ms": None,
+        "last_decision": None,
+        "last_source": None,
+        "last_decision_at": None,
+    })
+
+
+def ai_backend_label() -> str:
+    """Human-readable AI backend name for log lines."""
+    try:
+        return ai_decider.backend()
+    except Exception:
+        return "unknown"
 
 # Trailing Stop Configuration
 TRAILING_SL_BE_PROFIT = 100.0       # Move SL to breakeven when P&L >= $100
@@ -100,7 +147,8 @@ tl = TLAPI(
     environment=TL_ENV,
     username=TL_USER,
     password=TL_PASS,
-    server=TL_SERVER
+    server=TL_SERVER,
+    log_level="warning"
 )
 
 # =============================================================================
@@ -792,6 +840,8 @@ async def check_and_close_overdue_positions(positions_df=None):
 async def start_trailing_stop_monitor():
     """Start the breakeven SL monitoring background task."""
     import asyncio
+
+    _ai_reset_stats()
     
     async def be_check_loop():
         monitor_interval = POSITION_MONITOR_INTERVAL_SECONDS
@@ -1012,51 +1062,79 @@ def process_tradingview_alert(data: dict, task_id: str):
         log_alert(data, result)
         return result
 
-    # AI Risk Check (structured JSON for low-latency parsing)
-    prompt = f"""{{"symbol":"{tv_ticker}","tl_symbol":"{tl_symbol}","action":"{action}","entry":{live_price},"sl":{suggested_sl},"sl_dist":{abs(live_price - suggested_sl):.2f},"qty":{prelim_qty},"risk":{TARGET_DOLLAR_RISK},"trend":"{trend_context}","tech":"{tech_summary}","sessions":{TOP_SYMBOLS[tl_symbol]['sessions']},"rules":"max 3 concurrent, $400 daily loss, 1.5x R:R"}}
-Evaluate this trade for a 5M scalping prop challenge. Output ONLY valid JSON: {{"decision":"ALLOW"|"DENY","confidence":0.0-1.0,"reason":"brief"}}. Check for trend/technical direction conflicts. Decision must be ALLOW or DENY.
-"""
-    
-    try:
-        response = ollama.chat(
-            model='phi3:mini',
-            messages=[{'role': 'user', 'content': prompt}]
-        )
-        agent_decision = response['message']['content']
-        print(f"[AI DECISION] {agent_decision[:200]}", flush=True)
-    except Exception as e:
-        result = {"status": "error", "message": f"AI Agent unavailable: {str(e)}"}
-        log_alert(data, result)
-        return result
-    
-    # Parse Ollama JSON response (handles plain JSON, markdown-wrapped, multi-block)
-    decision = "DENY"
-    confidence = 0.0
-    reason = "no reason provided"
-    try:
-        text = agent_decision.strip()
-        # Find all potential JSON objects (non-greedy)
-        json_candidates = re.findall(r'\{[^{}]*\}', text, re.DOTALL)
-        for candidate in json_candidates:
-            try:
-                # Fix invalid numbers like 00.4 (leading zeros)
-                fixed = re.sub(r':\s*0+(\d)', lambda m: f': {m.group(1)}', candidate)
-                ai_response = json.loads(fixed)
-                if "decision" in ai_response:
-                    decision = ai_response.get("decision", "").upper()
-                    confidence = ai_response.get("confidence", 0.0)
-                    reason = ai_response.get("reason", "no reason provided")
-                    break
-            except (json.JSONDecodeError, ValueError):
-                continue
-        if decision == "DENY":
-            if "ALLOW" in text.upper() or "APPROVED" in text.upper():
-                decision = "ALLOW"
-    except Exception as exc:
-        print(f"[AI] JSON parse failed: {exc}, defaulting to DENY", flush=True)
-        decision = "DENY"
+    # AI Risk Check (structured JSON verdict, bounded by timeout and concurrency)
+    # The payload is serialised with json.dumps so that a quote character in a
+    # TradingView-supplied field (trend, alert name) cannot break out of the
+    # JSON literal in the prompt.
+    ai_payload = {
+        "symbol": tv_ticker,
+        "tl_symbol": tl_symbol,
+        "action": action,
+        "entry": live_price,
+        "sl": suggested_sl,
+        "sl_dist": round(abs(live_price - suggested_sl), 2),
+        "qty": prelim_qty,
+        "risk": TARGET_DOLLAR_RISK,
+        "trend": trend_context,
+        "tech": tech_summary,
+        "sessions": TOP_SYMBOLS[tl_symbol]['sessions'],
+        "rules": f"max {MAX_OPEN_TRADES} concurrent, ${MAX_DAILY_LOSS:.0f} daily loss, 1.5x R:R",
+    }
+    prompt = (
+        json.dumps(ai_payload) + "\n"
+        "Evaluate this trade for a 5M scalping prop challenge. "
+        "Check for trend/technical direction conflicts. "
+        "Decision must be ALLOW or DENY."
+    )
 
-    agent_notes = f"{decision} (confidence: {confidence:.2f}): {reason}"
+    if not _AI_GATE.acquire(timeout=AI_QUEUE_TIMEOUT_SECONDS):
+        _AI_STATE["failures"] += 1
+        _AI_STATE["last_error"] = "ai queue saturated"
+        result = {
+            "status": "error",
+            "reason": "ai evaluation queue saturated",
+            "fail_open": AI_FAIL_OPEN,
+        }
+        log_alert(data, result)
+        print("[AI] queue saturated; trade dropped", flush=True)
+        return result
+
+    try:
+        verdict = ai_decider.decide(prompt)
+    except ai_decider.AiUnavailable as exc:
+        _AI_STATE["failures"] += 1
+        _AI_STATE["last_error"] = f"{ai_backend_label()}: {exc}"
+        print(f"[AI] provider error: {_AI_STATE['last_error']}", flush=True)
+        result = {
+            "status": "error",
+            "reason": f"ai provider unavailable: {exc}",
+            "fail_open": AI_FAIL_OPEN,
+        }
+        log_alert(data, result)
+        if not AI_FAIL_OPEN:
+            return result
+        decision, confidence = "ALLOW", 0.0
+        reason = f"ai unavailable, fail-open: {exc}"
+        source = "fail-open"
+    else:
+        decision = verdict["decision"]
+        confidence = verdict["confidence"]
+        reason = verdict["reason"]
+        source = verdict["source"]
+        _AI_STATE["decisions"] += 1
+        _AI_STATE["last_latency_ms"] = verdict["latency_ms"]
+        _AI_STATE["last_decision"] = decision
+        _AI_STATE["last_source"] = source
+        _AI_STATE["last_decision_at"] = datetime.utcnow().isoformat() + "Z"
+        print(
+            f"[AI] {source} decision={decision} confidence={confidence:.2f} "
+            f"latency={verdict['latency_ms']}ms reason={reason}",
+            flush=True,
+        )
+    finally:
+        _AI_GATE.release()
+
+    agent_notes = f"{decision} (confidence: {confidence:.2f}, source={source}): {reason}"
     print(f"[AI PARSED] {agent_notes}", flush=True)
 
     if decision == "ALLOW":
@@ -1070,35 +1148,6 @@ Evaluate this trade for a 5M scalping prop challenge. Output ONLY valid JSON: {{
                 log_alert(data, result)
                 return result
 
-            # Calculate take profit price based on TP config
-            tp_config = TP_CONFIG.get(tl_symbol, {})
-            tp1_dollars = tp_config.get("tp1_dollars", 150)
-            tp2_dollars = tp_config.get("tp2_dollars")
-            
-            # Convert TP dollars to price distance
-            point_value = get_point_value(tl_symbol)
-            currency = TOP_SYMBOLS[tl_symbol].get("currency", "USD")
-            if currency == "EUR":
-                point_value *= 1.08  # EUR/USD conversion
-            
-            # TP1 = $150 (1.5R on $100 risk)
-            tp1_distance = tp1_dollars / (quantity * point_value)
-            tp1_distance = quantize_price(tp1_distance, tick_size)
-            
-            # Calculate absolute TP price from LIVE entry price
-            if action == "buy":
-                tp1_price = live_price + tp1_distance
-            else:  # sell
-                tp1_price = live_price - tp1_distance
-            tp1_price = quantize_price(tp1_price, tick_size)
-            
-            # Debug logging
-            print(f"[TP DEBUG] {tl_symbol} {action}: entry={live_price}, sl={suggested_sl}, qty={quantity}, "
-                  f"point_value={point_value}, tp1_distance={tp1_distance}, tp1_price={tp1_price}, tick_size={tick_size}", flush=True)
-            
-            # Recalculate position size with live price and validated SL
-            quantity = calculate_position_size(tv_ticker, live_price, suggested_sl)
-            
             # Calculate take profit price based on TP config
             tp_config = TP_CONFIG.get(tl_symbol, {})
             tp1_dollars = tp_config.get("tp1_dollars", 150)
@@ -1174,6 +1223,49 @@ Evaluate this trade for a 5M scalping prop challenge. Output ONLY valid JSON: {{
     result = {"status": "blocked", "agent_notes": agent_notes, "technical_summary": tech_summary, "tl_symbol": tl_symbol}
     log_alert(data, result)
     return result
+
+@app.get("/health")
+async def health():
+    """
+    Liveness plus AI backend state. Polled every 5 minutes by monitor_health.py.
+    Must stay fast and must never call the AI provider on the request path.
+    """
+    backend = ai_backend_label()
+    ai_info = {
+        "backend": backend,
+        "model": (ai_decider.CLOUD_API_MODEL if backend == "cloud" else ai_decider.AI_MODEL),
+        "fail_open": AI_FAIL_OPEN,
+        "max_concurrency": AI_MAX_CONCURRENCY,
+        "decisions": _AI_STATE["decisions"],
+        "failures": _AI_STATE["failures"],
+        "last_error": _AI_STATE["last_error"],
+        "last_latency_ms": _AI_STATE["last_latency_ms"],
+        "last_decision": _AI_STATE["last_decision"],
+        "last_source": _AI_STATE["last_source"],
+        "last_decision_at": _AI_STATE["last_decision_at"],
+    }
+
+    if backend == "cloud":
+        ai_info["key_configured"] = bool(ai_decider.CLOUD_API_KEY)
+        ai_info["endpoint_configured"] = bool(ai_decider.CLOUD_API_URL)
+    else:
+        try:
+            import httpx
+
+            with httpx.Client(timeout=2.0) as client:
+                resp = client.get(f"{ai_decider.OLLAMA_BASE_URL}/api/tags")
+            ai_info["reachable"] = resp.status_code == 200
+            ai_info["models_loaded"] = [m["name"] for m in resp.json().get("models", [])]
+        except Exception as exc:
+            ai_info["reachable"] = False
+            ai_info["last_error"] = f"{type(exc).__name__}: {exc}"
+
+    return {
+        "ok": True,
+        "service": "trader-agent",
+        "ts": datetime.utcnow().isoformat() + "Z",
+        "ai": ai_info,
+    }
 
 @app.get("/status")
 async def get_status():
