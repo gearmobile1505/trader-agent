@@ -62,8 +62,21 @@ cat /opt/trader-agent/scripts/health_monitor.log
 systemctl restart trader-agent
 ```
 
-Docker is still installed but idle (0 containers, ~0 MB). Juice Shop is gone. Stop it to reclaim a
-little memory on a 1 GB box: `systemctl stop docker && systemctl disable docker`.
+## Disk and memory reclaimed (2026-09-28)
+
+| Removed | Space |
+|---|---|
+| Docker images (juice-shop 511 MB, cloudflared 97 MB) | 608 MB |
+| LXD + core20/core22 snaps (zero instances in use) | ~400 MB |
+| snapd entirely, apt cache, orphaned packages | ~250 MB |
+| **Total** | **~2.1 GB** (11 GB used → 8.9 GB, 43% → 37%) |
+
+`dockerd`, `containerd` and `snapd` are stopped and masked, freeing ~64 MB of RAM. The trading
+stack never used Docker or snapd; both came from the droplet being built on the `docker-20-04`
+image for Juice Shop. Restore with `systemctl unmask docker.service docker.socket &&
+systemctl enable --now docker` if ever needed.
+
+Steady state is now ~505 MB available, 4 GB swap barely touched (34 MB).
 
 ## Known issues
 

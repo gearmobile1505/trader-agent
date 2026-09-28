@@ -25,8 +25,12 @@ AI_STATE_FILE = "/opt/trader-agent/scripts/.last_health_ai"
 CHECK_URL = "http://127.0.0.1:8000/status"
 HEALTH_URL = "http://127.0.0.1:8000/health"
 
-# Memory floor in MB. A 1 GB droplet has no headroom; this is the OOM early warning.
-MEMORY_FLOOR_MB = 512
+# Memory floor in MB, the OOM early warning.
+# This is a 1 GB droplet running uvicorn + cloudflared with no local model, and
+# its steady state is ~490 MB available. A 512 MB floor therefore fired on every
+# run and was pure noise. 300 MB sits far enough below steady state to be
+# meaningful while still catching a real leak well before the kernel killer.
+MEMORY_FLOOR_MB = 300
 # No AI decision for this long during a trading session means the reviewer is dead
 # or denying everything while the service reports healthy.
 AI_STALE_MINUTES = 120
@@ -209,13 +213,40 @@ def check_ai_backend(alerts):
     save_ai_state(previous)
 
 
+def load_flag(name, default=False):
+    """Read a persisted boolean flag. Used to alert on transitions, not state."""
+    return bool(load_ai_state().get(name, default))
+
+
+def save_flags(updates):
+    state = load_ai_state()
+    state.update(updates)
+    save_ai_state(state)
+
+
 def check_memory(alerts):
-    """Available-memory floor and any OOM kill in the last hour."""
+    """
+    Available-memory floor and any OOM kill in the last hour.
+
+    Change-guarded: logs when the box crosses the floor or recovers, not on
+    every cron tick while it stays low.
+    """
     available = available_memory_mb()
-    if available is not None and available < MEMORY_FLOOR_MB:
+    if available is None:
+        return
+
+    was_low = load_flag("mem_low")
+    is_low = available < MEMORY_FLOOR_MB
+    if is_low and not was_low:
         alerts.append(
             f"ALERT: available memory {available} MB is below the {MEMORY_FLOOR_MB} MB floor"
         )
+    elif was_low and not is_low:
+        alerts.append(
+            f"RECOVERED: available memory {available} MB is back above the {MEMORY_FLOOR_MB} MB floor"
+        )
+    if is_low != was_low:
+        save_flags({"mem_low": is_low})
 
     for line in recent_oom_kills():
         alerts.append(f"ALERT: kernel OOM event: {line.strip()[:200]}")
