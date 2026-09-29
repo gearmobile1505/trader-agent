@@ -1000,6 +1000,9 @@ def check_and_flatten_before_session_end(positions_df=None) -> int:
             if flatten_position(position_id, instrument_id, tl_symbol, reason,
                                 avg_price, unrealized_pl):
                 flattened += 1
+                # Drop the snapshot: it still lists this position, and the next
+                # 30s tick would otherwise re-issue a close order for it.
+                _POSITIONS_CACHE["expires_at"] = 0.0
     except Exception as exc:
         print(f"[SESSION] Flatten sweep error: {exc}", flush=True)
 
@@ -1055,17 +1058,27 @@ async def check_and_close_overdue_positions(positions_df=None):
                     flush=True,
                 )
 
+                # Pin the stop to entry first, then actually close. Relying on
+                # the stop alone is not enough: a thin-session gap can fill far
+                # beyond it, so the position is closed outright.
                 try:
                     tl.modify_position(position_id, {
                         "stopLossType": "absolute",
                         "stopLoss": avg_price,
                     })
                     print(
-                        f"[OVERDUE] Position {position_id}: SL moved to BE @{avg_price} for forced close",
+                        f"[OVERDUE] Position {position_id}: SL moved to BE @{avg_price}",
                         flush=True,
                     )
                 except Exception as exc:
                     print(f"[OVERDUE] Failed to set BE SL for position {position_id}: {exc}", flush=True)
+
+                try:
+                    tl.close_position(position_id=position_id)
+                    print(f"[OVERDUE] Position {position_id}: close order placed", flush=True)
+                    _POSITIONS_CACHE["expires_at"] = 0.0
+                except Exception as exc:
+                    print(f"[OVERDUE] Close order FAILED for position {position_id}: {exc}", flush=True)
 
     except Exception as e:
         print(f"[OVERDUE] Position age check error: {e}", flush=True)
