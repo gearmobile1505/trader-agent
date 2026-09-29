@@ -268,7 +268,10 @@ TOP_SYMBOLS = {
         "min_lot": 0.01,
         "max_lot": 0.30,
         "max_spread": 1.5,
-        "sessions": ["NY", "EU", "ASIA", "NY_EARLY"],
+        # ASIA + EU only. Yen crosses best in the London/Tokyo overlap; the NY
+        # and pre-market windows were added on 2026-09-22 but this pair had been
+        # running ASIA-only until then, which is why it had not traded in weeks.
+        "sessions": ["ASIA", "EU"],
         "description": "US Dollar vs Japanese Yen",
         "currency": "USD",
         "tick_size": 0.01
@@ -442,7 +445,14 @@ def map_symbol(tv_symbol: str) -> str:
         "6E": "EURUSD.R", "6J": "USDJPY.R", "6B": "GBPUSD.R", "6A": "AUDUSD.R",
         "6C": "USDCAD.R", "6N": "NZDUSD.R",
         # Direct CFD symbols (5m optimized)
-        "LVMH": "LVMH", "XPDUSD": "XPDUSD.R", "XPTUSD": "XPDUSD.R", "GOOG": "ALPHABET-C", "GOOGL": "ALPHABET-C",
+        # NOTE: XPTUSD is deliberately absent. It used to alias to XPDUSD.R,
+        # which meant a platinum (XPTUSD) alert silently traded palladium
+        # (XPDUSD.R) — different instruments, different prices, different risk.
+        # Platinum does exist at the broker as XPTUSD.R (id 13678) but is not in
+        # TOP_SYMBOLS, so an XPTUSD alert is now rejected as not-approved rather
+        # than executed against the wrong metal. Add it to TOP_SYMBOLS with its
+        # own point_value, tick_size and sessions before trading it.
+        "LVMH": "LVMH", "XPDUSD": "XPDUSD.R", "GOOG": "ALPHABET-C", "GOOGL": "ALPHABET-C",
         "UKOIL": "UKOIL.R", "USOIL": "USOIL.R", "SIEMENS": "SIEMENS", "GE": "GE",
         "US30": "US30.R", "US100": "NAS100.R", "US500": "SPX500.R", "XAUUSD": "XAUUSD.R",
         # Crypto
