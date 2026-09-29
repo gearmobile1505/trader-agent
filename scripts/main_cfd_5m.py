@@ -266,7 +266,14 @@ TOP_SYMBOLS = {
         "point_value_currency": "JPY",
         "fallback_point_value": 650.0,
         "min_lot": 0.01,
-        "max_lot": 0.30,
+        # Sizing ceiling, not a target. The bot places
+        # min(TARGET_DOLLAR_RISK / risk_per_lot, max_lot), so risk is pinned to
+        # $100 whenever the calculated size fits under this cap and strictly
+        # under $100 when it does not. Raising this from 0.30 to 0.40 admits
+        # tighter stops (the ATR*3 stop on this pair is routinely 0.2-0.6 pts,
+        # which needs 0.26-0.77 lots at $100 risk) without raising risk.
+        # At 0.30 every such setup was rejected outright.
+        "max_lot": 0.40,
         "max_spread": 1.5,
         # ASIA + EU only. Yen crosses best in the London/Tokyo overlap; the NY
         # and pre-market windows were added on 2026-09-22 but this pair had been
