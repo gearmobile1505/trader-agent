@@ -15,6 +15,7 @@ import threading
 from uuid import uuid4
 from datetime import datetime, timedelta
 from fastapi import FastAPI, Request
+import numpy as np
 import pandas as pd
 from tradelocker import TLAPI
 from dotenv import load_dotenv
@@ -1011,6 +1012,66 @@ def check_and_flatten_before_session_end(positions_df=None) -> int:
     return flattened
 
 
+def parse_position_open_time(pos) -> "datetime | None":
+    """Extract the position open time from a TradeLocker positions row.
+
+    The positions endpoint returns the column as ``openDate`` in epoch
+    milliseconds. An earlier version of this code read ``openTime``, which the
+    API never sends, so the max-hold rule silently matched nothing and no
+    position was ever closed for being overdue.
+
+    Accepts ``openDate`` and the legacy ``openTime`` spelling, numeric epoch
+    values in either seconds or milliseconds, and ISO-8601 strings. Returns
+    None when no usable timestamp is present so callers can report it instead
+    of skipping quietly.
+    """
+    from datetime import datetime, timezone
+
+    raw = pos.get("openDate", None)
+    if raw is None or (isinstance(raw, float) and not np.isfinite(raw)):
+        raw = pos.get("openTime", None)
+    if raw is None:
+        return None
+    if isinstance(raw, (float, np.floating)) and not np.isfinite(raw):
+        return None
+
+    if isinstance(raw, pd.Timestamp):
+        if raw.tzinfo is None:
+            return raw.tz_localize("UTC")
+        return raw.tz_convert("UTC")
+
+    # A pandas Series yields numpy scalars, and numpy.int64 is NOT a subclass of
+    # int, so a plain isinstance(raw, (int, float)) check silently rejects every
+    # real epoch value. Accept any real number instead.
+    if isinstance(raw, bool):
+        return None
+    if isinstance(raw, (int, float, np.integer, np.floating)):
+        value = float(raw)
+        if not np.isfinite(value) or value <= 0:
+            return None
+        # Epoch seconds vs milliseconds. Current time is ~1.8e9 in seconds and
+        # ~1.8e12 in milliseconds, so 1e11 cleanly separates the two scales and
+        # stays valid for roughly the next 11,000 years.
+        if value > 1e11:
+            value = value / 1000.0
+        try:
+            return datetime.fromtimestamp(value, tz=timezone.utc)
+        except (ValueError, OverflowError, OSError):
+            return None
+
+    if isinstance(raw, str):
+        text = raw.strip()
+        if not text or text.lower() in ("unknown", "none", "nat", "nan"):
+            return None
+        try:
+            parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+    return None
+
+
 async def check_and_close_overdue_positions(positions_df=None):
     """Close positions that have been open longer than MAX_HOLD_TIME_MINUTES.
 
@@ -1034,16 +1095,18 @@ async def check_and_close_overdue_positions(positions_df=None):
             avg_price = float(pos.get("avgPrice", 0.0))
             unrealized_pl = float(pos.get("unrealizedPl", 0.0))
 
-            open_time_str = pos.get("openTime", "unknown")
-            try:
-                if isinstance(open_time_str, (int, float)):
-                    open_time = datetime.fromtimestamp(open_time_str / 1000, tz=timezone.utc)
-                else:
-                    open_time = datetime.fromisoformat(open_time_str.replace("Z", "+00:00"))
-            except (ValueError, TypeError, AttributeError):
-                open_time = None
+            open_time = parse_position_open_time(pos)
 
             if open_time is None:
+                # Fail loudly. Skipping silently here makes the whole max-hold
+                # rule a silent no-op, which is how a position ran 4h36m
+                # against a 45m limit without a single line in the log.
+                print(
+                    f"[OVERDUE] Position {position_id}: cannot determine open time "
+                    f"(row keys: {sorted(pos.keys())}) — max-hold check SKIPPED, "
+                    f"position may be held indefinitely",
+                    flush=True,
+                )
                 continue
 
             age_minutes = (now - open_time).total_seconds() / 60
@@ -1082,6 +1145,108 @@ async def check_and_close_overdue_positions(positions_df=None):
 
     except Exception as e:
         print(f"[OVERDUE] Position age check error: {e}", flush=True)
+
+
+# A stop is a trigger, not a fill price. On a thin CFD the market can gap
+# through it and fill far beyond the stop, so a position sized for a $100 loss
+# can realize several hundred. This is how XPDUSD.R stopped at 1231.81 and
+# filled at 1282.29: 50.48 points of slippage, 5.2x the stop distance, turning
+# $86.58 of risk into $540.90. Detect it after the fact so the symbol's spread
+# and sizing can be corrected.
+SLIPPAGE_ALERT_MULTIPLE = 2.0  # flag a fill this many stop-distances past the stop
+# Fallback threshold for the order-history audit, which has no entry price and
+# so cannot compute a stop-distance multiple. 1% of the fill is far above
+# ordinary spread-induced slippage but well under the 4.1% seen on XPDUSD.R.
+STOP_FILL_OVERSHOOT_PCT = 0.01
+
+
+def classify_stop_fill_slippage(entry: float, stop: float, fill: float) -> dict | None:
+    """Compare a stop's fill against the stop distance it was meant to bound.
+
+    Returns None when the fill is ordinary, otherwise a dict describing the
+    overshoot so it can be logged and alerted on.
+    """
+    if not all(isinstance(v, (int, float)) for v in (entry, stop, fill)):
+        return None
+
+    stop_dist = abs(stop - entry)
+    if stop_dist <= 0:
+        return None
+
+    overshoot = abs(fill - stop)
+    if overshoot <= 0:
+        return None
+
+    multiple = overshoot / stop_dist
+    if multiple < SLIPPAGE_ALERT_MULTIPLE:
+        return None
+
+    return {
+        "stop_distance": stop_dist,
+        "overshoot": overshoot,
+        "multiple": multiple,
+        "entry": entry,
+        "stop": stop,
+        "fill": fill,
+    }
+
+
+def audit_recent_stop_fills(orders_df) -> int:
+    """Scan recent order history for stop orders that filled well past their stop.
+
+    Purely observational: it does not place or modify orders. Returns the number
+    of oversized fills found so callers can surface it.
+    """
+    if orders_df is None or len(orders_df) == 0:
+        return 0
+
+    flagged = 0
+    try:
+        stop_rows = orders_df[
+            (orders_df.get("type", pd.Series(dtype=object)).astype(str).str.lower() == "stop")
+            & (orders_df.get("status", pd.Series(dtype=object)).astype(str).str.lower() == "filled")
+        ]
+    except Exception as exc:
+        print(f"[SLIPPAGE] Could not scan order history: {exc}", flush=True)
+        return 0
+
+    for _, order in stop_rows.iterrows():
+        stop = _safe_float(order.get("price"))
+        fill = _safe_float(order.get("avgPrice"))
+        if stop is None or fill is None or stop <= 0 or fill <= 0:
+            continue
+
+        # A stop order is filed on the side opposite the position, so its
+        # trigger is the stop level and the fill is what the broker gave us.
+        # Order history carries no entry price, so measure the overshoot as a
+        # fraction of the fill, which scales across instruments whose price
+        # levels differ by orders of magnitude.
+        overshoot = abs(fill - stop)
+        if overshoot <= 0 or overshoot < fill * STOP_FILL_OVERSHOOT_PCT:
+            continue
+
+        flagged += 1
+        print(
+            f"[SLIPPAGE] Order {order.get('id')} stop@{stop} filled@{fill} "
+            f"({overshoot:.2f} pts, {overshoot / fill * 100:.2f}% past the trigger) "
+            f"— realized loss may exceed configured risk; review "
+            f"{resolve_symbol_for_instrument(int(order.get('tradableInstrumentId', 0))) or 'unknown'} "
+            f"spread and sizing",
+            flush=True,
+        )
+
+    return flagged
+
+
+def _safe_float(value):
+    """Best-effort float conversion that never raises."""
+    try:
+        if value is None:
+            return None
+        result = float(value)
+    except (TypeError, ValueError):
+        return None
+    return result if result == result else None  # drop NaN
 
 
 # Start background task on startup

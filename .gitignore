@@ -51,8 +51,12 @@ Dockerfile*
 docker-compose*
 
 # Test
-tests/
+# tests/ is intentionally NOT ignored: the risk logic needs regression
+# coverage, and a max-hold rule that silently stopped matching any row went
+# unnoticed for weeks because nothing ran against real API row shapes.
 test_*
+!tests/
+!tests/**/*.py
 
 # macOS
 .VolumeIcon.icns
