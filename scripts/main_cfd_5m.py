@@ -74,7 +74,7 @@ def ai_backend_label() -> str:
         return "unknown"
 
 # Trailing Stop Configuration
-TRAILING_SL_BE_PROFIT = 100.0       # Move SL to breakeven when P&L >= $100
+TRAILING_SL_BE_PROFIT = 75.0        # Move SL to breakeven when P&L >= $75
 POSITION_MONITOR_INTERVAL_SECONDS = 30
 POSITION_MONITOR_EMPTY_INTERVAL_SECONDS = 120
 POSITION_MONITOR_MAX_BACKOFF_SECONDS = 300
@@ -293,8 +293,8 @@ SHIFT_MULTIPLIER = 3.0
 TARGET_DOLLAR_RISK = 100.0        # $100 risk per trade
 MAX_DAILY_LOSS = 400.0            # Stop trading if -$400/day
 MAX_OPEN_TRADES = 3               # Max concurrent positions
-MIN_RISK_REWARD = 1.5             # Min R:R for entry
-MAX_HOLD_TIME_MINUTES = 45        # Max time a trade can be open (5m scalping)
+MIN_RISK_REWARD = 1.25            # Min R:R for entry
+MAX_HOLD_TIME_MINUTES = 180       # Max time a trade can be open (3 hours)
 MAX_SL_OVERSHOOT_PCT = 100          # Max % over target risk at SL (min lot basis)
 
 # Session exit protection
@@ -315,20 +315,20 @@ NO_ENTRY_ON_WEEKEND = True
 BLOCK_OPPOSING_SAME_SYMBOL = True
 
 # Take Profit Configuration
-# TP1 = $150 minimum (satisfies 1.5x R:R on $100 risk)
+# TP1 = $125 minimum (1.25x R:R on $100 risk)
 TP_CONFIG = {
-    "US30.R":     {"tp1_dollars": 150, "tp2_dollars": None, "trail_after_tp1": True},
-    "NAS100.R":   {"tp1_dollars": 150, "tp2_dollars": None, "trail_after_tp1": True},
-    "SPX500.R":   {"tp1_dollars": 150, "tp2_dollars": None, "trail_after_tp1": False},
-    "XAUUSD.R":   {"tp1_dollars": 150, "tp2_dollars": None, "trail_after_tp1": False},
-    "XPDUSD.R":   {"tp1_dollars": 150, "tp2_dollars": None, "trail_after_tp1": False},
-    "UKOIL.R":    {"tp1_dollars": 150, "tp2_dollars": None, "trail_after_tp1": False},
-    "LVMH":       {"tp1_dollars": 150, "tp2_dollars": None, "trail_after_tp1": True},
-    "SIEMENS":    {"tp1_dollars": 150, "tp2_dollars": None, "trail_after_tp1": True},
-    "ALPHABET-C": {"tp1_dollars": 150, "tp2_dollars": None, "trail_after_tp1": True},
-    "GE":         {"tp1_dollars": 150, "tp2_dollars": None, "trail_after_tp1": True},
-    "GBPJPY.R":   {"tp1_dollars": 150, "tp2_dollars": None, "trail_after_tp1": True},
-    "USDJPY.R":   {"tp1_dollars": 150, "tp2_dollars": None, "trail_after_tp1": True},
+    "US30.R":     {"tp1_dollars": 125, "tp2_dollars": None, "trail_after_tp1": True},
+    "NAS100.R":   {"tp1_dollars": 125, "tp2_dollars": None, "trail_after_tp1": True},
+    "SPX500.R":   {"tp1_dollars": 125, "tp2_dollars": None, "trail_after_tp1": False},
+    "XAUUSD.R":   {"tp1_dollars": 125, "tp2_dollars": None, "trail_after_tp1": False},
+    "XPDUSD.R":   {"tp1_dollars": 125, "tp2_dollars": None, "trail_after_tp1": False},
+    "UKOIL.R":    {"tp1_dollars": 125, "tp2_dollars": None, "trail_after_tp1": False},
+    "LVMH":       {"tp1_dollars": 125, "tp2_dollars": None, "trail_after_tp1": True},
+    "SIEMENS":    {"tp1_dollars": 125, "tp2_dollars": None, "trail_after_tp1": True},
+    "ALPHABET-C": {"tp1_dollars": 125, "tp2_dollars": None, "trail_after_tp1": True},
+    "GE":         {"tp1_dollars": 125, "tp2_dollars": None, "trail_after_tp1": True},
+    "GBPJPY.R":   {"tp1_dollars": 125, "tp2_dollars": None, "trail_after_tp1": True},
+    "USDJPY.R":   {"tp1_dollars": 125, "tp2_dollars": None, "trail_after_tp1": True},
 }
 
 # Session time ranges (ET)
