@@ -286,6 +286,23 @@ MIN_RISK_REWARD = 1.5             # Min R:R for entry
 MAX_HOLD_TIME_MINUTES = 45        # Max time a trade can be open (5m scalping)
 MAX_SL_OVERSHOOT_PCT = 100          # Max % over target risk at SL (min lot basis)
 
+# Session exit protection
+# A position is flattened this long before its trading session ends. Holding
+# into a close exposes the position to the illiquid gap afterwards, where the
+# spread widens far past the stop and the stop can fill well beyond the
+# intended risk. A trade that was green before the close can close red.
+SESSION_CLOSE_BUFFER_MINUTES = 15
+# Friday: flatten the whole book by this hour ET, regardless of symbol session,
+# so nothing is carried into the weekend gap.
+WEEKEND_FLATTEN_HOUR_ET = 18
+# CFD markets are closed at the weekend. ASIA (20:00-06:00 ET) spans the
+# weekend, so a naive session check would still allow Saturday entries.
+NO_ENTRY_ON_WEEKEND = True
+# Never hold both directions on the same instrument at once. Two opposing
+# positions on one CFD net out at the broker but still pay spread twice and
+# can leave a residual position through a session close.
+BLOCK_OPPOSING_SAME_SYMBOL = True
+
 # Take Profit Configuration
 # TP1 = $150 minimum (satisfies 1.5x R:R on $100 risk)
 TP_CONFIG = {
@@ -335,6 +352,84 @@ def is_session_active(symbol_config: dict) -> bool:
                 return True
     return False
 
+def is_weekend_et() -> bool:
+    """True Saturday/Sunday in ET. CFD markets are closed; ASIA spans the weekend."""
+    import pytz
+    return datetime.now(pytz.timezone('US/Eastern')).weekday() >= 5
+
+
+def session_exit_info(symbol_config: dict) -> tuple[bool, float | None]:
+    """
+    Return (in_session, minutes_until_latest_session_end).
+
+    When a symbol has overlapping sessions the position may legitimately stay
+    open until the last of them ends, so the latest end wins. minutes is None
+    when no configured session is currently active.
+    """
+    import pytz
+
+    now_et = datetime.now(pytz.timezone('US/Eastern'))
+    current = now_et.hour + now_et.minute / 60 + now_et.second / 3600
+    weekend = now_et.weekday() >= 5
+
+    latest = None
+    for session in symbol_config.get("sessions", []):
+        if weekend and session in ("NY", "NY_EARLY", "NY_MORNING"):
+            continue
+        start, end = SESSIONS_ET.get(session, (0, 24))
+
+        if start < end:
+            if not (start <= current < end):
+                continue
+            minutes = (end - current) * 60
+        else:
+            # Overnight window, e.g. ASIA 20:00 -> 06:00
+            if current >= start:
+                end_dt = (now_et + timedelta(days=1)).replace(
+                    hour=int(end), minute=int((end % 1) * 60), second=0, microsecond=0
+                )
+            elif current < end:
+                end_dt = now_et.replace(
+                    hour=int(end), minute=int((end % 1) * 60), second=0, microsecond=0
+                )
+            else:
+                continue
+            minutes = (end_dt - now_et).total_seconds() / 60
+
+        latest = minutes if latest is None else max(latest, minutes)
+
+    return (latest is not None, latest)
+
+
+def flatten_reason(symbol_config: dict) -> str | None:
+    """
+    Return why this symbol must be flattened right now, or None to hold.
+
+    Covers three ways a position can be stranded past its session: the session
+    already closed, the session closes inside the buffer window, or it is
+    Friday and the weekend gap is approaching.
+    """
+    import pytz
+
+    now_et = datetime.now(pytz.timezone('US/Eastern'))
+
+    if now_et.weekday() >= 5:
+        return "weekend: markets closed"
+
+    # Friday: flatten the whole book before the weekend gap.
+    if now_et.weekday() == 4 and now_et.hour >= WEEKEND_FLATTEN_HOUR_ET:
+        return f"Friday {WEEKEND_FLATTEN_HOUR_ET:02d}:00 ET weekend flatten window"
+
+    in_session, minutes = session_exit_info(symbol_config)
+    if not in_session:
+        return "trading session closed"
+
+    if minutes is not None and minutes <= SESSION_CLOSE_BUFFER_MINUTES:
+        return f"{minutes:.0f}m until session close"
+
+    return None
+
+
 def map_symbol(tv_symbol: str) -> str:
     """Map TradingView symbol to TradeLocker CFD symbol."""
     SYMBOL_MAP = {
@@ -360,6 +455,38 @@ def map_symbol(tv_symbol: str) -> str:
 # Cache for get_all_positions to prevent TradeLocker API hammering
 _POSITIONS_CACHE: dict = {"data": None, "expires_at": 0.0}
 _POSITIONS_CACHE_TTL = 120.0
+
+
+_INSTRUMENT_ID_CACHE: dict = {}
+_INSTRUMENT_ID_TTL = 3600.0
+
+
+def get_instrument_id(tl_symbol: str) -> int:
+    """
+    Cached instrument id lookup.
+
+    The bare tradelocker call hits the API on every invocation, and the
+    per-position symbol resolution loops below call it once per symbol per
+    open position. That is what produced the 429 rate limits.
+    """
+    now = datetime.now().timestamp()
+    cached = _INSTRUMENT_ID_CACHE.get(tl_symbol)
+    if cached is not None and now < cached[1]:
+        return cached[0]
+    value = tl.get_instrument_id_from_symbol_name(tl_symbol)
+    _INSTRUMENT_ID_CACHE[tl_symbol] = (value, now + _INSTRUMENT_ID_TTL)
+    return value
+
+
+def resolve_symbol_for_instrument(instrument_id: int) -> str | None:
+    """Map a broker instrument id back to our configured symbol, or None."""
+    for sym in TOP_SYMBOLS:
+        try:
+            if get_instrument_id(sym) == instrument_id:
+                return sym
+        except Exception:
+            continue
+    return None
 
 
 def get_cached_positions():
@@ -497,7 +624,7 @@ def validate_spread(tl_symbol: str) -> tuple[bool, str]:
 
     max_spread = TOP_SYMBOLS[tl_symbol].get("max_spread", 5.0)
     try:
-        instrument_id = tl.get_instrument_id_from_symbol_name(tl_symbol)
+        instrument_id = get_instrument_id(tl_symbol)
         bid = tl.get_latest_bid_price(instrument_id)
         ask = tl.get_latest_asking_price(instrument_id)
         if bid <= 0 or ask <= 0:
@@ -517,7 +644,7 @@ def validate_spread(tl_symbol: str) -> tuple[bool, str]:
 def get_live_price(tl_symbol: str) -> float:
     """Fetch current market price from TradeLocker for a symbol."""
     try:
-        instrument_id = tl.get_instrument_id_from_symbol_name(tl_symbol)
+        instrument_id = get_instrument_id(tl_symbol)
         end_ts = int(datetime.now().timestamp() * 1000)
         start_ts = int((datetime.now() - timedelta(minutes=10)).timestamp() * 1000)
         hist = tl.get_price_history(
@@ -539,7 +666,7 @@ def calculate_atr_sl(tl_symbol: str, action: str, current_price: float) -> float
     """Calculate stop loss using ATR(10) * 3.0 from recent price data (Phantom Shift params).
     Uses current market price for SL calculation, not stale alert price."""
     try:
-        instrument_id = tl.get_instrument_id_from_symbol_name(tl_symbol)
+        instrument_id = get_instrument_id(tl_symbol)
         # Fetch last 20 5m bars for ATR calculation
         end_ts = int(datetime.now().timestamp() * 1000)
         start_ts = int((datetime.now() - timedelta(hours=2)).timestamp() * 1000)
@@ -635,7 +762,7 @@ def get_technical_summary(tl_symbol: str) -> str:
     a rating: "Strong Buy", "Buy", "Neutral", "Sell", "Strong Sell".
     """
     try:
-        instrument_id = tl.get_instrument_id_from_symbol_name(tl_symbol)
+        instrument_id = get_instrument_id(tl_symbol)
         end_ts = int(datetime.now().timestamp() * 1000)
         start_ts = int((datetime.now() - timedelta(hours=18)).timestamp() * 1000)
         hist = tl.get_price_history(
@@ -765,6 +892,122 @@ async def check_and_apply_trailing_stops(positions_df=None):
         print(f"[BE SL] Background task error: {e}", flush=True)
 
 
+def find_opposing_position(tl_symbol: str, action: str, positions_df=None):
+    """
+    Return the open position that blocks this entry, or None.
+
+    Same instrument, opposite side. Blocks a buy when a sell is already open on
+    that CFD and vice versa.
+    """
+    if not BLOCK_OPPOSING_SAME_SYMBOL:
+        return None
+    if positions_df is None:
+        positions_df = get_cached_positions()
+    if positions_df is None or positions_df.empty:
+        return None
+
+    try:
+        instrument_id = get_instrument_id(tl_symbol)
+    except Exception as exc:
+        print(f"[OPPOSING] Could not resolve {tl_symbol} instrument id: {exc}", flush=True)
+        return None
+
+    opposite = "sell" if str(action).lower() == "buy" else "buy"
+    for _, pos in positions_df.iterrows():
+        if int(pos.get("tradableInstrumentId", 0)) != instrument_id:
+            continue
+        if str(pos.get("side", "")).lower() == opposite:
+            return pos
+    return None
+
+
+def flatten_position(position_id: int, instrument_id: int, tl_symbol: str,
+                     reason: str, avg_price: float, unrealized_pl: float) -> bool:
+    """
+    Force a position closed: breakeven stop first, then a close order.
+
+    close_position() is documented as not guaranteed to fill immediately (it
+    tries IOC then GTC), so the stop is moved to entry first. That way the
+    worst case is closing flat at entry rather than riding the gap.
+    """
+    print(
+        f"[SESSION] Position {position_id} {tl_symbol} {reason} "
+        f"entry={avg_price} PnL=${unrealized_pl:.2f} — FLATTENING",
+        flush=True,
+    )
+
+    try:
+        tl.modify_position(position_id, {
+            "stopLossType": "absolute",
+            "stopLoss": avg_price,
+        })
+        print(f"[SESSION] Position {position_id}: SL pinned to entry {avg_price}", flush=True)
+    except Exception as exc:
+        print(f"[SESSION] Position {position_id}: breakeven stop failed: {exc}", flush=True)
+
+    try:
+        tl.close_position(position_id=position_id)
+        print(f"[SESSION] Position {position_id}: close order placed", flush=True)
+        return True
+    except Exception as exc:
+        print(f"[SESSION] Position {position_id}: close order FAILED: {exc}", flush=True)
+        return False
+
+
+def check_and_flatten_before_session_end(positions_df=None) -> int:
+    """
+    Close every position whose trading session is closing, already closed, or
+    about to hit the weekend gap.
+
+    This is the guarantee that no trade is held past its session: is_session_active()
+    only gates entry, so without this a position opened near the close rides the
+    illiquid gap and can fill far beyond its stop.
+    """
+    if positions_df is None:
+        positions_df = get_cached_positions()
+
+    flattened = 0
+    try:
+        if positions_df is None or positions_df.empty:
+            return 0
+
+        for _, pos in positions_df.iterrows():
+            position_id = int(pos.get("id", 0))
+            if not position_id:
+                continue
+            instrument_id = int(pos.get("tradableInstrumentId", 0))
+            qty = float(pos.get("qty", 0.0))
+            side = str(pos.get("side", ""))
+            avg_price = float(pos.get("avgPrice", 0.0))
+            unrealized_pl = float(pos.get("unrealizedPl", 0.0))
+
+            if qty == 0:
+                continue
+
+            tl_symbol = resolve_symbol_for_instrument(instrument_id)
+            if tl_symbol is None:
+                print(
+                    f"[SESSION] Position {position_id}: instrument {instrument_id} is not in "
+                    f"the configured symbol list, cannot evaluate session — leaving open",
+                    flush=True,
+                )
+                continue
+
+            reason = flatten_reason(TOP_SYMBOLS[tl_symbol])
+            if reason is None:
+                continue
+
+            if flatten_position(position_id, instrument_id, tl_symbol, reason,
+                                avg_price, unrealized_pl):
+                flattened += 1
+    except Exception as exc:
+        print(f"[SESSION] Flatten sweep error: {exc}", flush=True)
+
+    if flattened:
+        print(f"[SESSION] Flattened {flattened} position(s) ahead of a session close", flush=True)
+    return flattened
+
+
 async def check_and_close_overdue_positions(positions_df=None):
     """Close positions that have been open longer than MAX_HOLD_TIME_MINUTES.
 
@@ -803,14 +1046,7 @@ async def check_and_close_overdue_positions(positions_df=None):
             age_minutes = (now - open_time).total_seconds() / 60
 
             if age_minutes > MAX_HOLD_TIME_MINUTES:
-                symbol_name = "UNKNOWN"
-                for sym, cfg in TOP_SYMBOLS.items():
-                    try:
-                        if tl.get_instrument_id_from_symbol_name(sym) == instrument_id:
-                            symbol_name = sym
-                            break
-                    except Exception:
-                        continue
+                symbol_name = resolve_symbol_for_instrument(instrument_id) or "UNKNOWN"
 
                 print(
                     f"[OVERDUE] Position {position_id} {symbol_name} {side} {qty} "
@@ -868,6 +1104,9 @@ async def start_trailing_stop_monitor():
             monitor_interval = POSITION_MONITOR_INTERVAL_SECONDS
             await check_and_apply_trailing_stops(positions_df)
             await check_and_close_overdue_positions(positions_df)
+            # Session-exit guard must run last: it can close positions, which
+            # invalidates the snapshot the two checks above just used.
+            check_and_flatten_before_session_end(positions_df)
 
     asyncio.create_task(be_check_loop())
     print(
@@ -1045,12 +1284,34 @@ def process_tradingview_alert(data: dict, task_id: str):
         log_alert(data, result)
         return result
 
-    # Check max concurrent positions
+    # Weekend guard: ASIA spans Sat/Sun, so the session check alone would still
+    # admit weekend entries on a market that is closed.
+    if NO_ENTRY_ON_WEEKEND and is_weekend_et():
+        result = {"status": "rejected", "reason": "Weekend: CFD markets are closed"}
+        log_alert(data, result)
+        return result
+
+    # Check max concurrent positions and opposing exposure
     try:
         positions_df = get_cached_positions()
         if positions_df is not None and len(positions_df) >= MAX_OPEN_TRADES:
             result = {"status": "rejected", "reason": f"Max {MAX_OPEN_TRADES} concurrent positions reached"}
             log_alert(data, result)
+            return result
+
+        # Never add to a position in the opposite direction on the same instrument
+        blocker = find_opposing_position(tl_symbol, action, positions_df)
+        if blocker is not None:
+            result = {
+                "status": "rejected",
+                "reason": (
+                    f"Opposing {str(blocker.get('side', '')).upper()} position already open on "
+                    f"{tl_symbol} (qty {blocker.get('qty')}, entry {blocker.get('avgPrice')}, "
+                    f"PnL ${float(blocker.get('unrealizedPl', 0.0)):.2f}) — {action.upper()} blocked"
+                ),
+            }
+            log_alert(data, result)
+            print(f"[OPPOSING] {tl_symbol} {action.upper()} blocked by open {blocker.get('side')} position", flush=True)
             return result
     except Exception as exc:
         print(f"[POSITION CHECK] Could not check open positions: {exc}", flush=True)
@@ -1139,7 +1400,7 @@ def process_tradingview_alert(data: dict, task_id: str):
 
     if decision == "ALLOW":
         try:
-            instrument_id = tl.get_instrument_id_from_symbol_name(tl_symbol)
+            instrument_id = get_instrument_id(tl_symbol)
 
             # Recalculate position size with live price and validated SL (in case price moved slightly)
             quantity = calculate_position_size(tv_ticker, live_price, suggested_sl)

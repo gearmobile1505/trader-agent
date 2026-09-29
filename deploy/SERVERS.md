@@ -78,6 +78,24 @@ systemctl enable --now docker` if ever needed.
 
 Steady state is now ~505 MB available, 4 GB swap barely touched (34 MB).
 
+## Position safety (added 2026-09-29)
+
+Two gaps found after a trade flipped from green to -$500+ across a session gap:
+
+- **No trade is held past its session.** `is_session_active()` only gated *entry*; nothing
+  closed positions, and the 45-minute age check merely moved the stop to breakeven without
+  closing. A background sweep now flattens any position whose session has closed, closes within
+  15 minutes, or that is still open on Friday after 18:00 ET. Flatten = breakeven stop first
+  (the close order is IOC-then-GTC and may not fill), then a close order.
+- **Weekend guard.** ASIA (20:00-06:00 ET) spans Saturday, so the old session check would have
+  admitted Saturday entries on a closed market. Entries are now rejected at the weekend and the
+  whole book is flattened Friday after 18:00 ET.
+- **No opposing positions on one instrument.** A buy is rejected while a sell is open on that
+  symbol and vice versa; the rejection reason names the blocking position.
+- Instrument-id lookups are cached for an hour (9 call sites, 3 remain direct). The per-position
+  symbol resolution loops were calling the broker once per symbol per open position every 30s,
+  which is what drove the earlier 429s.
+
 ## Known issues
 
 - **SSH is firewalled to two IPs** (`174.209.193.129`, `73.106.218.36`). If your home IP changes you
