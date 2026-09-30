@@ -294,7 +294,7 @@ TARGET_DOLLAR_RISK = 100.0        # $100 risk per trade
 MAX_DAILY_LOSS = 400.0            # Stop trading if -$400/day
 MAX_OPEN_TRADES = 3               # Max concurrent positions
 MIN_RISK_REWARD = 1.25            # Min R:R for entry
-MAX_HOLD_TIME_MINUTES = 300       # Max time a trade can be open (5 hours)
+MAX_HOLD_TIME_MINUTES = 0         # 0 = no max hold limit (rely on session-end flattening)
 MAX_SL_OVERSHOOT_PCT = 100          # Max % over target risk at SL (min lot basis)
 
 # Session exit protection
@@ -1094,7 +1094,10 @@ async def check_and_close_overdue_positions(positions_df=None):
 
     For 5m scalping, trades should not run for hours. This catches any
     positions where the SL/trailing mechanism failed to trigger.
+    Set MAX_HOLD_TIME_MINUTES = 0 to disable (rely on session-end flattening).
     """
+    if MAX_HOLD_TIME_MINUTES <= 0:
+        return
     if positions_df is None:
         positions_df = get_cached_positions()
     try:
