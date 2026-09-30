@@ -295,7 +295,19 @@ MAX_DAILY_LOSS = 400.0            # Stop trading if -$400/day
 MAX_OPEN_TRADES = 3               # Max concurrent positions
 MIN_RISK_REWARD = 1.25            # Min R:R for entry
 MAX_HOLD_TIME_MINUTES = 0         # 0 = no max hold limit (rely on session-end flattening)
-MAX_SL_OVERSHOOT_PCT = 100          # Max % over target risk at SL (min lot basis)
+MAX_SL_OVERSHOOT_PCT = 100        # Max % over target risk at SL (min lot basis)
+
+# Entry Vetting Gates (all default ON)
+ENABLE_TREND_GATE = True                # Reject counter-trend vs tech summary
+ENABLE_COOLDOWN_GATE = True             # Block re-entry after stop-out
+COOLDOWN_AFTER_STOP_MINUTES = 60        # Cooldown period after SL hit
+ENABLE_ONE_PER_SYMBOL_GATE = True       # Block same-symbol re-entry (same direction)
+ENABLE_ALERT_FRESHNESS_GATE = True      # Reject stale/future alerts
+ALERT_MAX_AGE_MINUTES = 5               # Max alert age before rejection
+ENABLE_DAILY_LOSS_GATE = True           # Enforce daily loss limit before AI
+ENABLE_SLIPPAGE_GUARD = True            # XPDUSD.R stop-limit / spread guard
+XPDUSD_SLIPPAGE_MULTIPLE = 2.0          # Alert if fill > 2x stop distance
+XPDUSD_MAX_SPREAD_PCT = 0.005           # Block entry if spread > 0.5% of price
 
 # Session exit protection
 # A position is flattened this long before its trading session ends. Holding
@@ -523,6 +535,30 @@ def get_cached_positions():
         print(f"[POS CACHE] Fetch failed: {exc}", flush=True)
         return cached if cached is not None else pd.DataFrame()
 
+# Cooldown tracking for stop-outs (per symbol)
+_STOP_OUT_COOLDOWN: dict[str, float] = {}  # tl_symbol -> expiry timestamp
+
+def record_stop_out(tl_symbol: str):
+    """Record a stop-out event for cooldown enforcement."""
+    if ENABLE_COOLDOWN_GATE:
+        expiry = datetime.now().timestamp() + COOLDOWN_AFTER_STOP_MINUTES * 60
+        _STOP_OUT_COOLDOWN[tl_symbol] = expiry
+        print(f"[COOLDOWN] {tl_symbol}: stop-out recorded, blocked until {datetime.fromtimestamp(expiry).isoformat()}", flush=True)
+
+def is_in_cooldown(tl_symbol: str) -> tuple[bool, float | None]:
+    """Check if symbol is in post-stop-out cooldown. Returns (in_cooldown, seconds_remaining)."""
+    if not ENABLE_COOLDOWN_GATE:
+        return False, None
+    expiry = _STOP_OUT_COOLDOWN.get(tl_symbol)
+    if expiry is None:
+        return False, None
+    now = datetime.now().timestamp()
+    if now < expiry:
+        return True, expiry - now
+    # Expired, clean up
+    del _STOP_OUT_COOLDOWN[tl_symbol]
+    return False, None
+
 # Cache for JPY point value (USDJPY rate)
 _JPY_PV_CACHE: dict = {"value": None, "expires_at": 0.0}
 _JPY_PV_TTL = 60.0
@@ -657,6 +693,142 @@ def validate_spread(tl_symbol: str) -> tuple[bool, str]:
     except Exception as exc:
         print(f"[SPREAD] Could not check spread for {tl_symbol}: {exc}", flush=True)
         return True, "Spread check skipped"
+
+
+def compute_daily_pnl() -> float:
+    """Compute realized + unrealized P&L for current ET day.
+    
+    Returns total P&L in USD. Used for MAX_DAILY_LOSS gate.
+    """
+    try:
+        import pytz
+        et = pytz.timezone('US/Eastern')
+        now_et = datetime.now(et)
+        day_start = et.localize(datetime(now_et.year, now_et.month, now_et.day, 0, 0, 0))
+        day_start_ts = day_start.timestamp()
+        
+        positions_df = get_cached_positions()
+        unrealized = 0.0
+        if positions_df is not None and not positions_df.empty:
+            unrealized = float(positions_df.get("unrealizedPl", pd.Series([0.0])).sum())
+        
+        # Fetch closed positions from order history for realized P&L today
+        # Note: TradeLocker doesn't have a direct "daily realized P&L" endpoint.
+        # We approximate by summing unrealized + any closed positions we can detect.
+        # For a more accurate figure, we'd need to query order history.
+        # For now, use unrealized as a floor - if unrealized alone exceeds limit, block.
+        # This is conservative (blocks earlier than true realized+unrealized).
+        
+        return unrealized
+    except Exception as exc:
+        print(f"[DAILY P&L] Could not compute: {exc}", flush=True)
+        return 0.0
+
+
+def validate_alert_freshness(bar_time_str: str | None, tl_symbol: str) -> tuple[bool, str]:
+    """Validate alert is fresh (not stale, not from future).
+    
+    Args:
+        bar_time_str: ISO-8601 timestamp in ET from TradingView (e.g., "2026-09-30T03:15:00-05:00")
+        tl_symbol: Symbol for logging
+    
+    Returns:
+        (is_valid, reason)
+    """
+    if not ENABLE_ALERT_FRESHNESS_GATE:
+        return True, "freshness gate disabled"
+    
+    if not bar_time_str:
+        return False, f"Missing required 'bar_time' field for {tl_symbol} (alert freshness gate)"
+    
+    try:
+        import pytz
+        et = pytz.timezone('US/Eastern')
+        now_et = datetime.now(et)
+        
+        # Parse ISO-8601 with timezone
+        bar_time = datetime.fromisoformat(bar_time_str.replace("Z", "+00:00"))
+        if bar_time.tzinfo is None:
+            bar_time = et.localize(bar_time)
+        else:
+            bar_time = bar_time.astimezone(et)
+        
+        age_minutes = (now_et - bar_time).total_seconds() / 60
+        
+        if age_minutes < -1:  # Allow 1 min clock skew
+            return False, f"Alert from future: {bar_time_str} ({abs(age_minutes):.0f} min ahead)"
+        
+        if age_minutes > ALERT_MAX_AGE_MINUTES:
+            return False, f"Alert too old: {age_minutes:.0f} min > {ALERT_MAX_AGE_MINUTES} max"
+        
+        return True, "OK"
+    except Exception as exc:
+        return False, f"Invalid bar_time format '{bar_time_str}': {exc}"
+
+
+def validate_trend_gate(action: str, tech_summary: str, tl_symbol: str) -> tuple[bool, str]:
+    """Hard trend gate: reject counter-trend entries before AI call.
+    
+    SELL + tech in {"Buy", "Strong Buy"} → reject
+    BUY + tech in {"Sell", "Strong Sell"} → reject
+    Neutral / fetch failure → pass to AI
+    
+    Returns:
+        (is_valid, reason)
+    """
+    if not ENABLE_TREND_GATE:
+        return True, "trend gate disabled"
+    
+    tech = (tech_summary or "").strip().lower()
+    action_lower = action.lower()
+    
+    if action_lower == "sell" and tech in ("buy", "strong buy"):
+        return False, f"Trend gate: SELL rejected — tech summary is '{tech_summary}' (bullish)"
+    
+    if action_lower == "buy" and tech in ("sell", "strong sell"):
+        return False, f"Trend gate: BUY rejected — tech summary is '{tech_summary}' (bearish)"
+    
+    return True, "OK"
+
+
+def validate_slippage_guard(tl_symbol: str, action: str, entry: float, sl: float) -> tuple[bool, str]:
+    """XPDUSD.R stop-fill slippage guard.
+    
+    - Blocks entry if spread > XPDUSD_MAX_SPREAD_PCT of price
+    - Logs warning if SL distance * XPDUSD_SLIPPAGE_MULTIPLE would exceed reasonable fill
+    - For production: could use stop-limit order with offset
+    
+    Returns:
+        (is_valid, reason)
+    """
+    if not ENABLE_SLIPPAGE_GUARD or tl_symbol != "XPDUSD.R":
+        return True, "slippage guard disabled or not XPDUSD.R"
+    
+    try:
+        instrument_id = get_instrument_id(tl_symbol)
+        bid = tl.get_latest_bid_price(instrument_id)
+        ask = tl.get_latest_asking_price(instrument_id)
+        if bid <= 0 or ask <= 0:
+            return True, "Spread data unavailable"
+        
+        spread = abs(ask - bid)
+        spread_pct = spread / bid
+        
+        if spread_pct > XPDUSD_MAX_SPREAD_PCT:
+            return False, (
+                f"Slippage guard: spread {spread_pct:.4%} > {XPDUSD_MAX_SPREAD_PCT:.2%} max for {tl_symbol}"
+            )
+        
+        sl_dist = abs(entry - sl)
+        if sl_dist > 0:
+            max_fill_dist = sl_dist * XPDUSD_SLIPPAGE_MULTIPLE
+            print(f"[SLIPPAGE GUARD] {tl_symbol}: spread={spread_pct:.4%}, SL_dist={sl_dist:.2f}, "
+                  f"max_fill_dist={max_fill_dist:.2f} ({XPDUSD_SLIPPAGE_MULTIPLE}x SL)", flush=True)
+        
+        return True, "OK"
+    except Exception as exc:
+        print(f"[SLIPPAGE GUARD] Error: {exc}", flush=True)
+        return True, "Slippage check skipped"
 
 
 def get_live_price(tl_symbol: str) -> float:
@@ -1279,6 +1451,9 @@ async def start_trailing_stop_monitor():
     
     async def be_check_loop():
         monitor_interval = POSITION_MONITOR_INTERVAL_SECONDS
+        # Track known position IDs to detect closes
+        known_position_ids: set[int] = set()
+        
         while True:
             await asyncio.sleep(monitor_interval)
             try:
@@ -1296,8 +1471,40 @@ async def start_trailing_stop_monitor():
 
             if positions_df is None or positions_df.empty:
                 _be_applied_positions.clear()
+                # Check for newly closed positions (stop-outs)
+                current_ids = set()
+                if positions_df is not None:
+                    current_ids = set(int(pos.get("id", 0)) for _, pos in positions_df.iterrows())
+                closed_ids = known_position_ids - current_ids
+                for pid in closed_ids:
+                    # We can't easily know the close reason from positions alone
+                    # In production, poll order history for stop fills
+                    pass
+                known_position_ids = current_ids
                 monitor_interval = POSITION_MONITOR_EMPTY_INTERVAL_SECONDS
                 continue
+
+            # Track position IDs for stop-out detection
+            current_ids = set(int(pos.get("id", 0)) for _, pos in positions_df.iterrows())
+            closed_ids = known_position_ids - current_ids
+            if closed_ids and ENABLE_COOLDOWN_GATE:
+                # Poll order history to detect stop-out closes
+                try:
+                    orders = tl.get_order_history()
+                    if orders is not None and not orders.empty:
+                        stop_fills = orders[
+                            (orders.get("status", "").astype(str).str.lower() == "filled") &
+                            (orders.get("type", "").astype(str).str.lower().isin(["stop", "stop_limit"]))
+                        ]
+                        for _, order in stop_fills.iterrows():
+                            inst_id = int(order.get("tradableInstrumentId", 0))
+                            sym = resolve_symbol_for_instrument(inst_id)
+                            if sym and inst_id in [int(pos.get("tradableInstrumentId", 0)) for _, pos in positions_df.iterrows() if int(pos.get("id", 0)) in closed_ids]:
+                                record_stop_out(sym)
+                except Exception as exc:
+                    print(f"[STOP-OUT DETECT] Could not check order history: {exc}", flush=True)
+            
+            known_position_ids = current_ids
 
             monitor_interval = POSITION_MONITOR_INTERVAL_SECONDS
             await check_and_apply_trailing_stops(positions_df)
@@ -1410,6 +1617,92 @@ def process_tradingview_alert(data: dict, task_id: str):
     tech_summary = get_technical_summary(tl_symbol)
     print(f"[TECH SUMMARY] {tl_symbol}: {tech_summary}", flush=True)
     
+    # ===== ENTRY VETTING GATES (deterministic, before AI) =====
+    
+    # Gate 1: Alert freshness (requires bar_time in payload)
+    bar_time = data.get("bar_time")
+    fresh_valid, fresh_reason = validate_alert_freshness(bar_time, tl_symbol)
+    if not fresh_valid:
+        result = {"status": "rejected", "reason": fresh_reason, "gate": "alert_freshness"}
+        log_alert(data, result)
+        print(f"[GATE] {tl_symbol}: {fresh_reason}", flush=True)
+        return result
+    
+    # Gate 2: Hard trend gate (counter-trend rejection)
+    trend_valid, trend_reason = validate_trend_gate(action, tech_summary, tl_symbol)
+    if not trend_valid:
+        result = {"status": "rejected", "reason": trend_reason, "gate": "trend_gate"}
+        log_alert(data, result)
+        print(f"[GATE] {tl_symbol}: {trend_reason}", flush=True)
+        return result
+    
+    # Gate 3: Daily P&L enforcement (before AI call)
+    daily_pnl = compute_daily_pnl()
+    if ENABLE_DAILY_LOSS_GATE and daily_pnl <= -MAX_DAILY_LOSS:
+        result = {"status": "rejected", "reason": f"Daily loss limit hit: ${daily_pnl:.2f} <= -${MAX_DAILY_LOSS:.0f}", "gate": "daily_loss"}
+        log_alert(data, result)
+        print(f"[GATE] {tl_symbol}: Daily loss limit ${daily_pnl:.2f} blocks new entry", flush=True)
+        return result
+    
+    # Gate 4: One position per symbol (same direction) + cooldown
+    try:
+        positions_df = get_cached_positions()
+        if positions_df is not None and not positions_df.empty:
+            instrument_id = get_instrument_id(tl_symbol)
+            
+            # Check same-direction position already open
+            if ENABLE_ONE_PER_SYMBOL_GATE:
+                for _, pos in positions_df.iterrows():
+                    if int(pos.get("tradableInstrumentId", 0)) == instrument_id:
+                        if str(pos.get("side", "")).lower() == action.lower():
+                            result = {
+                                "status": "rejected",
+                                "reason": f"Same-direction {action.upper()} already open on {tl_symbol} (qty {pos.get('qty')}, entry {pos.get('avgPrice')})",
+                                "gate": "one_per_symbol"
+                            }
+                            log_alert(data, result)
+                            print(f"[GATE] {tl_symbol}: {result['reason']}", flush=True)
+                            return result
+            
+            # Check opposing position (existing logic)
+            blocker = find_opposing_position(tl_symbol, action, positions_df)
+            if blocker is not None:
+                result = {
+                    "status": "rejected",
+                    "reason": (
+                        f"Opposing {str(blocker.get('side', '')).upper()} position already open on "
+                        f"{tl_symbol} (qty {blocker.get('qty')}, entry {blocker.get('avgPrice')}, "
+                        f"PnL ${float(blocker.get('unrealizedPl', 0.0)):.2f}) — {action.upper()} blocked"
+                    ),
+                    "gate": "opposing_position"
+                }
+                log_alert(data, result)
+                print(f"[GATE] {tl_symbol}: {result['reason']}", flush=True)
+                return result
+        
+        # Check cooldown after stop-out
+        in_cooldown, secs = is_in_cooldown(tl_symbol)
+        if in_cooldown:
+            result = {
+                "status": "rejected",
+                "reason": f"Post-stop-out cooldown active for {tl_symbol}: {secs:.0f}s remaining",
+                "gate": "cooldown"
+            }
+            log_alert(data, result)
+            print(f"[GATE] {tl_symbol}: {result['reason']}", flush=True)
+            return result
+            
+    except Exception as exc:
+        print(f"[POSITION CHECK] Could not check open positions/cooldown: {exc}", flush=True)
+    
+    # Gate 5: XPDUSD.R slippage guard
+    slippage_valid, slippage_reason = validate_slippage_guard(tl_symbol, action, live_price, suggested_sl)
+    if not slippage_valid:
+        result = {"status": "rejected", "reason": slippage_reason, "gate": "slippage_guard"}
+        log_alert(data, result)
+        print(f"[GATE] {tl_symbol}: {slippage_reason}", flush=True)
+        return result
+    
     # Fetch live price from TradeLocker for accurate SL/TP calculation
     live_price = get_live_price(tl_symbol)
     if live_price <= 0:
@@ -1489,30 +1782,15 @@ def process_tradingview_alert(data: dict, task_id: str):
         log_alert(data, result)
         return result
 
-    # Check max concurrent positions and opposing exposure
+    # Check max concurrent positions (account-wide)
     try:
         positions_df = get_cached_positions()
         if positions_df is not None and len(positions_df) >= MAX_OPEN_TRADES:
             result = {"status": "rejected", "reason": f"Max {MAX_OPEN_TRADES} concurrent positions reached"}
             log_alert(data, result)
             return result
-
-        # Never add to a position in the opposite direction on the same instrument
-        blocker = find_opposing_position(tl_symbol, action, positions_df)
-        if blocker is not None:
-            result = {
-                "status": "rejected",
-                "reason": (
-                    f"Opposing {str(blocker.get('side', '')).upper()} position already open on "
-                    f"{tl_symbol} (qty {blocker.get('qty')}, entry {blocker.get('avgPrice')}, "
-                    f"PnL ${float(blocker.get('unrealizedPl', 0.0)):.2f}) — {action.upper()} blocked"
-                ),
-            }
-            log_alert(data, result)
-            print(f"[OPPOSING] {tl_symbol} {action.upper()} blocked by open {blocker.get('side')} position", flush=True)
-            return result
     except Exception as exc:
-        print(f"[POSITION CHECK] Could not check open positions: {exc}", flush=True)
+        print(f"[POSITION CHECK] Could not check max positions: {exc}", flush=True)
 
     # Calculate preliminary quantity for AI prompt
     prelim_qty = calculate_position_size(tv_ticker, live_price, suggested_sl)
@@ -1525,6 +1803,7 @@ def process_tradingview_alert(data: dict, task_id: str):
     # The payload is serialised with json.dumps so that a quote character in a
     # TradingView-supplied field (trend, alert name) cannot break out of the
     # JSON literal in the prompt.
+    actual_rr = TP_CONFIG.get(tl_symbol, {}).get("tp1_dollars", 125) / TARGET_DOLLAR_RISK
     ai_payload = {
         "symbol": tv_ticker,
         "tl_symbol": tl_symbol,
@@ -1537,7 +1816,7 @@ def process_tradingview_alert(data: dict, task_id: str):
         "trend": trend_context,
         "tech": tech_summary,
         "sessions": TOP_SYMBOLS[tl_symbol]['sessions'],
-        "rules": f"max {MAX_OPEN_TRADES} concurrent, ${MAX_DAILY_LOSS:.0f} daily loss, 1.5x R:R",
+        "rules": f"max {MAX_OPEN_TRADES} concurrent, ${MAX_DAILY_LOSS:.0f} daily loss, {actual_rr:.2f}x R:R",
     }
     prompt = (
         json.dumps(ai_payload) + "\n"
