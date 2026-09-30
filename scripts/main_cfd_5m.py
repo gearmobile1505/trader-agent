@@ -294,7 +294,7 @@ TARGET_DOLLAR_RISK = 100.0        # $100 risk per trade
 MAX_DAILY_LOSS = 400.0            # Stop trading if -$400/day
 MAX_OPEN_TRADES = 3               # Max concurrent positions
 MIN_RISK_REWARD = 1.25            # Min R:R for entry
-MAX_HOLD_TIME_MINUTES = 180       # Max time a trade can be open (3 hours)
+MAX_HOLD_TIME_MINUTES = 300       # Max time a trade can be open (5 hours)
 MAX_SL_OVERSHOOT_PCT = 100          # Max % over target risk at SL (min lot basis)
 
 # Session exit protection
