@@ -1,6 +1,6 @@
 # Phantom Flow — 5M Scalping Bot
 
-AI-powered CFD trading webhook bridge. TradingView signals → AI review (Ollama/phi3:mini) → TradeLocker execution.
+AI-powered CFD trading webhook bridge. TradingView signals → AI review (cloud/deepseek-chat) → TradeLocker execution.
 
 ## Quick Start
 
@@ -25,25 +25,23 @@ For temporary testing only, expose port 8000 with localtunnel or ngrok and updat
 
 ### Production architecture
 ```text
-TradingView → Cloudflare DNS/proxy → Nginx :443 → FastAPI :8000 (localhost)
-                                                     ├→ Ollama / phi3:mini
-                                                    └→ TradeLocker
+TradingView → Cloudflare Tunnel (webhook.cello1505.com) → FastAPI :8000 (localhost)
+                                                      ├→ Cloud AI / deepseek-chat
+                                                      └→ TradeLocker
 ```
 
 The supported production path is DigitalOcean + Terraform + a Cloudflare-managed domain + Nginx TLS. Cloudflare Tunnel is an alternative edge path, but it is not created by the Terraform in this repository; follow the separate tunnel subsection below if that is the chosen design.
 
 ### Current deployment state
 
-The current DigitalOcean deployment has been migrated from manually uploaded files to the GitHub checkout:
+**Live server (Option B):** `138.197.8.50` — 1 vCPU, 1 GB RAM, cloud AI (deepseek-chat)
+- **Tunnel:** `webhook.cello1505.com` (named Cloudflare Tunnel, stable hostname)
+- **Services:** `trader-agent` (uvicorn), `cloudflared` (tunnel) — both active, enabled
+- **Git working tree:** `/opt/trader-agent` (branch `main`, auto-updated via `git pull`)
+- **Secrets:** SOPS/age encrypted `.env` in Git, decrypted at runtime by server-held age private key
+- **Health:** Verified via `curl https://webhook.cello1505.com/status` and `/symbols`
 
-```text
-/opt/trader-agent              # Git working tree, branch main
-/opt/trader-agent/scripts/     # FastAPI application and strategy scripts
-/opt/trader-agent/venv/        # Server virtual environment
-/opt/trader-agent/.env         # Server-only credentials, mode 600
-```
-
-The live service has been verified with `trader-agent` active, TradeLocker authentication successful, FastAPI bound to `127.0.0.1:8000`, Nginx serving the local API, and Cloudflare forwarding the public status endpoint. The current Quick Tunnel hostname is temporary; replace it with a named Cloudflare Tunnel and stable domain before treating the endpoint as production-ready.
+**Old server (decommissioned):** `143.198.7.200` — `trader-agent` and `cloudflared` stopped/disabled, droplet removed from Terraform state, manual destroy via DO Dashboard pending.
 
 The migration keeps the previous manually uploaded deployment in a timestamped `/opt/trader-agent-manual-*` backup. Do not remove that backup until the Git-managed service has been observed through a complete trading session.
 
@@ -58,9 +56,10 @@ The deployment has four boundaries: provision the host, install the application,
 - An SSH key already added to DigitalOcean.
 - A TradeLocker account, server name, and credentials. Start with demo credentials.
 - Terraform >= 1.5 and Git on the operator machine.
-- The Ollama model required by the app (`llama3` by default).
+- **SOPS + age** (for secrets encryption): `brew install sops age` (macOS) or `apt install age && install sops binary` (Linux)
+- **Cloud AI API key** (deepseek-chat or compatible) — no local Ollama required
 
-Never commit `terraform.tfvars`, `.env`, broker credentials, or API tokens. Terraform state can contain sensitive values, so keep `terraform.tfstate` private and use encrypted remote state for a team deployment.
+Never commit `terraform.tfvars`, `.env` (plaintext), broker credentials, or API tokens. Terraform state can contain sensitive values, so keep `terraform.tfstate` private and use encrypted remote state for a team deployment. The repository stores **encrypted** `.env` (SOPS/age) — safe to commit.
 
 ### 2. Provision DigitalOcean
 
@@ -124,40 +123,58 @@ sudo -u trader /opt/trader-agent/venv/bin/pip install -r requirements.txt
 The service must run the repository module from the `scripts/` directory. Before starting it, inspect `/etc/systemd/system/trader-agent.service` and ensure it contains:
 ```ini
 WorkingDirectory=/opt/trader-agent
-ExecStart=/opt/trader-agent/venv/bin/uvicorn scripts.main_cfd_5m:app --host 127.0.0.1 --port 8000 --workers 1
+ExecStart=/opt/trader-agent/start.sh
 ```
 
-The cloud-init template currently writes a root-level module path and binds to all interfaces. Replace those values before starting the service:
-```bash
-sudo sed -i \
-  -e 's#main_cfd_5m:app#scripts.main_cfd_5m:app#' \
-  -e 's#--host 0.0.0.0#--host 127.0.0.1#' \
-  /etc/systemd/system/trader-agent.service
-```
+**Secrets management (SOPS/age):**
+1. On server: `age-keygen -o /etc/sops/age/keys.txt` (keep private, chmod 600)
+2. Local: create `.sops.yaml` with server's public key, encrypt `.env` with `sops .env`
+3. Commit encrypted `.env` and `.sops.yaml` to Git
+4. Server startup script (`/opt/trader-agent/start.sh`) decrypts to temp file, sources it, runs uvicorn
+5. Plaintext secrets never touch disk on server
 
-The application currently reads `TL_ENV`, `TL_USER`, `TL_PASS`, and `TL_SERVER`. Ensure `/opt/trader-agent/.env` uses those names, is owned by `trader`, and is private:
-```bash
-sudo install -o trader -g trader -m 600 /dev/null /opt/trader-agent/.env
-sudoedit /opt/trader-agent/.env
-```
+The application reads `TL_ENV`, `TL_USER`, `TL_PASS`, `TL_SERVER`, `AI_PROVIDER`, `CLOUD_API_URL`, `CLOUD_API_KEY`, `CLOUD_API_MODEL`, `AI_MAX_CONCURRENCY`, `AI_QUEUE_TIMEOUT_SECONDS`, `AI_FAIL_OPEN`. Ensure `/opt/trader-agent/.env` (encrypted in Git) uses those names.
 
-Example:
+Example (plaintext for reference — **do not commit plaintext**):
 ```env
 TL_ENV=https://demo.tradelocker.com
 TL_USER=your_trade_locker_email
 TL_PASS=your_trade_locker_password
 TL_SERVER=GATESFX
-OLLAMA_MODEL=phi3:mini
+AI_PROVIDER=cloud
+CLOUD_API_URL=https://api.deepseek.com/chat/completions
+CLOUD_API_KEY=sk-...
+CLOUD_API_MODEL=deepseek-chat
+AI_FAIL_OPEN=0
+AI_MAX_CONCURRENCY=2
+AI_QUEUE_TIMEOUT_SECONDS=30
 ```
-
-The Terraform bootstrap currently writes `TRADELOCKER_EMAIL`, `TRADELOCKER_PASSWORD`, and `TRADELOCKER_SERVER`; those names do not match the app. Correct the file as above before enabling `trader-agent`. Do not paste real credentials into shell history.
 
 ### 4. Start and verify the application
 
 ```bash
-sudo sed -i 's#/health#/status#g' \
-  /etc/nginx/sites-available/trader-agent /opt/trader-agent/health_check.sh
-sudo nginx -t
+# Install cloudflared and create named tunnel
+curl -L https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb -o /tmp/cloudflared.deb
+sudo dpkg -i /tmp/cloudflared.deb
+cloudflared tunnel login
+cloudflared tunnel create trader-agent
+cloudflared tunnel route dns trader-agent webhook.yourdomain.com
+
+# Create tunnel config (use UUID from 'cloudflared tunnel create')
+cat > /etc/cloudflared/config.yml <<EOF
+tunnel: YOUR_TUNNEL_UUID
+credentials-file: /root/.cloudflared/YOUR_TUNNEL_UUID.json
+
+ingress:
+  - hostname: webhook.yourdomain.com
+    service: http://127.0.0.1:8000
+  - service: http_status:404
+EOF
+
+sudo cloudflared service install
+sudo systemctl enable --now cloudflared
+
+# Start trader-agent
 sudo systemctl daemon-reload
 sudo systemctl enable --now trader-agent
 sudo systemctl status trader-agent --no-pager
@@ -166,37 +183,14 @@ curl -fsS http://127.0.0.1:8000/status
 curl -fsS http://127.0.0.1:8000/symbols
 ```
 
-The application exposes `/status`, not `/health`; the replacement above aligns the generated Nginx and cron checks before the service starts. If the service fails, check `journalctl -u trader-agent -e`, confirm `.env` names, confirm Ollama is ready (`systemctl status ollama`), and confirm the working directory contains `scripts/main_cfd_5m.py`. Do not expose port 8000 publicly; FastAPI should listen on localhost and Nginx should be the only web entry point.
-
-### 5. Configure Cloudflare DNS
-
-1. Add the domain to Cloudflare and change the registrar nameservers to the nameservers Cloudflare provides.
-2. Create proxied (orange cloud) A records for `webhook` and, if needed, `api`, pointing to the droplet IPv4 address. Avoid AAAA records unless IPv6 is intentionally configured and tested.
-3. Set **SSL/TLS → Overview** to **Full (strict)** after the origin certificate is installed.
-4. Under **SSL/TLS → Edge Certificates**, enable **Always Use HTTPS** and verify the minimum TLS version.
-5. Add a rate limit or WAF rule for `/webhook` appropriate to TradingView traffic. Do not challenge or block TradingView requests accidentally.
-
-Terraform can create DigitalOcean DNS records when `domain_name` is set, but those records are not Cloudflare records. If Cloudflare is authoritative, create or import the records in Cloudflare and do not maintain the same DNS zone in two providers.
-
-### 6. Configure Nginx and origin TLS
-
-The bootstrap creates `/etc/nginx/sites-available/trader-agent` and proxies `/webhook` and `/status` to FastAPI after the route alignment in step 4. Set its `server_name` to the webhook hostname before requesting a certificate:
+Verify the complete edge path:
 ```bash
-sudo sed -i 's/server_name _;/server_name webhook.example.com;/' \
-  /etc/nginx/sites-available/trader-agent
-sudo nginx -t && sudo systemctl reload nginx
-sudo certbot --nginx -d webhook.example.com
-sudo certbot renew --dry-run
+curl -fsS https://webhook.yourdomain.com/status
 ```
 
-Select the redirect-to-HTTPS option when Certbot asks. Confirm the complete edge path:
-```bash
-curl -fsS https://webhook.example.com/status
-```
+FastAPI listens on localhost only; Cloudflare Tunnel is the only public entry point. No Nginx/Certbot needed.
 
-The DigitalOcean firewall allows SSH only from `ssh_ip` and allows public 80/443. It does not need inbound port 8000. Keep SSH restricted to a stable administrator IP and update it before that IP changes.
-
-### 7. Configure TradingView
+### 5. Configure TradingView
 
 Use the stable URL:
 ```text
@@ -210,16 +204,15 @@ sudo journalctl -u trader-agent -f
 
 Confirm the response is successful, the symbol is approved, the session is active, the AI decision is understood, and the broker account is the intended demo account. Only then enable the production alert schedule.
 
-### 8. Operations and updates
+### 6. Operations and updates
 
 ```bash
-sudo systemctl status trader-agent
+sudo systemctl status trader-agent cloudflared
 sudo journalctl -u trader-agent -f
-sudo systemctl status nginx ollama
 sudo -u trader git -C /opt/trader-agent status
 ```
 
-For a controlled update, stop alerts, back up `.env` and logs, then run the pull as the `trader` user. Running Git as root can produce Git's `dubious ownership` error:
+For a controlled update, stop alerts, back up logs, then run the pull as the `trader` user. Running Git as root can produce Git's `dubious ownership` error:
 ```bash
 sudo -u trader git -C /opt/trader-agent pull --ff-only origin main
 sudo -u trader /opt/trader-agent/venv/bin/pip install \
@@ -229,9 +222,9 @@ sudo systemctl is-active --quiet trader-agent
 curl -fsS http://127.0.0.1:8000/status
 ```
 
-The repository contains the application code; `.env`, `venv`, logs, and the server-created `health_check.sh` remain outside the committed source. Roll back by checking out the last known-good commit as `trader` and restarting the service. Review daily loss and open-position limits after every configuration change.
+The repository contains the application code; `.env` (encrypted), `venv`, logs remain outside the committed source. Roll back by checking out the last known-good commit as `trader` and restarting the service. Review daily loss and open-position limits after every configuration change.
 
-### Webhook and trade outcome logging
+### 7. Webhook and trade outcome logging
 
 The webhook response status and the trade result are different signals. An HTTP `200 OK` means FastAPI received and processed the request; it does not prove that TradeLocker accepted an order. The application records the decision and broker response in:
 
@@ -373,10 +366,11 @@ Test every update with the local status endpoint before re-enabling TradingView 
 
 - **Technical Summary** — Live computation: EMA(9/21), SMA(50), RSI(14), MACD, ADX, Williams %R → rating fed to AI as directional bias
 - **Phantom Shift Strategy** — ATR(10) × 3.0 dynamic stop loss
-- **Trailing Stop** — $75 trigger, $50 trail distance on profitable positions
-- **AI Risk Assessment** — Ollama phi3:mini reviews every trade (approve/reject)
-- **Position Sizing** — $125 risk per trade, dynamic: `qty = $125 / (SL_distance × point_value)`, capped by max_lot
+- **Breakeven Stop** — Move SL to entry when P&L ≥ $75
+- **AI Risk Assessment** — Cloud AI (deepseek-chat) reviews every trade (approve/reject)
+- **Position Sizing** — $100 risk per trade, dynamic: `qty = $100 / (SL_distance × point_value)`, capped by max_lot
 - **Session Trading** — ASIA, EU, NY_EARLY, NY sessions
+- **Max Hold Time** — 3 hours (180 min), then force-close
 
 ## AI Decision Flow
 
@@ -397,13 +391,15 @@ If Technical Summary contradicts the Phantom Signal, AI flags it as a risk facto
 
 | Parameter | Value |
 |-----------|-------|
-| Risk per Trade | $125 |
+| Risk per Trade (SL) | $100 |
+| Take Profit (TP1) | $125 |
+| Breakeven Trigger | $75 |
 | Max Daily Loss | $400 |
 | Max Open Trades | 3 |
-| Min Risk:Reward | 1.5 |
-| TP1 | $200 (indices/stocks), $300 (others) |
+| Min Risk:Reward | 1.25 |
+| Max Hold Time | 180 min (3 hours) |
 | Max Lot (GBPJPY.R) | 0.20 |
-| Max Lot (USDJPY.R) | 0.30 |
+| Max Lot (USDJPY.R) | 0.40 |
 
 ## Files
 
@@ -448,27 +444,26 @@ This project can be replicated by a friend on their own infrastructure. The stra
 
 - **PineScript** (`phantom.pine`) - same indicator, same signal logic
 - **Python code** (`main_cfd_5m.py`) - same strategy, risk params, ATR config, symbol mappings
-- **Ollama model** `phi3:mini` (2.2GB) - same model
-- **Risk parameters**: $125 risk/trade, max 3 concurrent, $500 daily loss limit
+- **Cloud AI model** `deepseek-chat` - same model (no local Ollama needed)
+- **Risk parameters**: $100 risk/trade, TP $125, BE $75, max 3 concurrent, $400 daily loss limit
 - **Session configs**: ASIA, EU, NY, NY_EARLY, NY_MORNING definitions
-- **TP config**: Per-symbol TP levels from swing analysis P70 percentiles
+- **TP config**: Per-symbol TP levels ($125 across all symbols)
 
 ### Minimum Server Specs
 
-- **Droplet**: s-2vcpu-4gb ($24/mo minimum)
-- **RAM**: 4GB (phi3:mini model = 2.2GB + service ~1.5GB)
-- **Disk**: 50GB minimum
+- **Droplet**: s-1vcpu-1gb ($6/mo minimum, cloud AI removes local model requirement)
+- **RAM**: 1GB (no local LLM)
+- **Disk**: 25GB minimum
 - **Region**: nyc3 recommended (same as current)
 
 ### Setup Sequence for New User
 
 1. Create DO account → create droplet with user_data.sh (update GitHub clone URL to their repo)
-2. Set up TradeLocker `.env` with their credentials
-3. Start Ollama, pull `phi3:mini`
-4. Start cloudflared → get tunnel URL
-5. Start trader-agent service
-6. Set up TradingView alert with their tunnel webhook URL
-7. Test webhook returns immediately with `task_id`
+2. Set up TradeLocker `.env` with their credentials (use SOPS/age encryption)
+3. Install cloudflared, create named tunnel, route DNS
+4. Start trader-agent service (uses encrypted .env, decrypts at runtime)
+5. Set up TradingView alert with their tunnel webhook URL
+6. Test webhook returns immediately with `task_id`
 
 ### Critical Gotchas
 
@@ -485,10 +480,11 @@ This project can be replicated by a friend on their own infrastructure. The stra
 |-------|-----|
 | "Outside trading session" | Check ET time matches symbol sessions (ASIA/EU active on weekends; NY/NY_EARLY blocked) |
 | "Symbol not approved" | Use exact chart symbol from mapping |
-| AI timeout | Verify `ollama serve` is running |
+| AI timeout | Verify cloud API key and endpoint in `.env` |
 | Broker error | Check `.env` credentials, TradeLocker demo status |
-| Tunnel URL changed | For temporary testing, run the tunnel monitor and update TradingView; production should use the stable domain URL |
-| Position too large | max_lot cap prevents >0.20/0.30 lots on JPY pairs |
+| Tunnel URL changed | Production uses stable named tunnel domain; only dev uses trycloudflare.com |
+| Position too large | max_lot cap prevents >0.20/0.40 lots on JPY pairs |
+| SOPS decrypt fails | Verify `/etc/sops/age/keys.txt` exists, chmod 644, server has age private key |
 
 ---
 
