@@ -11,11 +11,12 @@
 1. Zon opens a PR on a `vetting/...` branch containing a brief file (the exact spec) plus an agent-instruction comment listing the items.
 2. You implement on that branch, add the tests the brief names, and **post the replay/test numbers as a PR comment**.
 3. Zon verifies your commits line-by-line against the brief and comments on anything missing, divergent, or already done.
-4. **Nothing merges and nothing deploys until the owner approves.** Replay numbers before merge, every time, no exceptions.
+4. **Nothing merges to `main` and nothing deploys until the owner approves.** Replay numbers before merge, every time, no exceptions.
 
 ## Standing rules (never violate)
 
 - **Risk is frozen:** $100 TARGET_DOLLAR_RISK, $125 TP1 + trail-after-TP1, $75 breakeven trigger, $400 MAX_DAILY_LOSS amount, the sizing formula and lot caps. Only entry vetting, state persistence, and observability ever change.
+- **Main is the branch that ships — always push changes to `main`.** `main` is the source of truth the server runs. Implement on the brief branch, and once the owner approves, merge to `main` promptly. Never leave finished, approved work sitting on a side branch, and never push unapproved work to `main`.
 - The `bar_time` freshness gate at 10 minutes max age is a **deliberate buffer**, not a bug. Do not "fix" it to `trigger_time`.
 - SESSIONS_ET windows and each symbol's enabled sessions change only when a brief explicitly says so. The current map came from a 60-day 5m backtest (commit `8daf1ec`).
 - If a brief item looks already implemented, unnecessary, or wrong, say so in the PR **with file/line evidence** instead of silently skipping or re-doing it. Every claim gets checked against the code — that's how we caught that the round-2 hardening never landed despite being reported done.
