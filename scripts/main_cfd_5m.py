@@ -1623,6 +1623,57 @@ def process_tradingview_alert(data: dict, task_id: str):
     tech_summary = get_technical_summary(tl_symbol)
     print(f"[TECH SUMMARY] {tl_symbol}: {tech_summary}", flush=True)
     
+    # Fetch live price from TradeLocker for accurate SL/TP calculation (needed by vetting gates)
+    live_price = get_live_price(tl_symbol)
+    if live_price <= 0:
+        result = {"status": "rejected", "reason": "Could not fetch live price from TradeLocker"}
+        log_alert(data, result)
+        return result
+    
+    MIN_SL_PCT = {
+        "GBPJPY.R": 0.003, "USDJPY.R": 0.003,
+        "US30.R": 0.003, "NAS100.R": 0.003, "SPX500.R": 0.003,
+        "XAUUSD.R": 0.005, "XPDUSD.R": 0.005, "UKOIL.R": 0.003,
+        "LVMH": 0.005, "SIEMENS": 0.005, "ALPHABET-C": 0.005, "GE": 0.005,
+    }
+    # Wider percentage-based SL fallback for when ATR can't be calculated
+    FALLBACK_SL_PCT = {
+        "GBPJPY.R": 0.010, "USDJPY.R": 0.010,
+        "XPDUSD.R": 0.020, "XAUUSD.R": 0.020, "UKOIL.R": 0.020,
+    }
+
+    print(f"[LIVE PRICE] {tl_symbol}: live_price={live_price}, webhook_price={indicator_val}", flush=True)
+    
+    # Auto-calculate SL from ATR if not provided or invalid (handles TradingView placeholder strings)
+    if suggested_sl <= 0 or abs(indicator_val - suggested_sl) < 0.01:
+        atr_sl = calculate_atr_sl(tl_symbol, action, live_price)
+        if atr_sl > 0:
+            suggested_sl = atr_sl
+            print(f"[AUTO-SL] {tl_symbol} {action}: Calculated SL from ATR(10)*3 = {suggested_sl}")
+        else:
+            # Fallback: percentage-based SL when ATR data unavailable
+            fallback_pct = FALLBACK_SL_PCT.get(tl_symbol, 0.015)
+            if action == "buy":
+                suggested_sl = live_price * (1 - fallback_pct)
+            else:
+                suggested_sl = live_price * (1 + fallback_pct)
+            print(f"[ATR FALLBACK] {tl_symbol} {action}: ATR unavailable, using {fallback_pct:.1%} fallback SL = {suggested_sl}", flush=True)
+    
+    # Round SL to symbol's tick size (broker requirement)
+    tick_size = TOP_SYMBOLS[tl_symbol].get("tick_size", 0.01)
+    suggested_sl = quantize_price(suggested_sl, tick_size)
+    
+    # Enforce minimum SL distance (prevents ATR from giving too-tight stops)
+    min_sl_dist = live_price * MIN_SL_PCT.get(tl_symbol, 0.005)
+    actual_sl_dist = abs(live_price - suggested_sl)
+    if actual_sl_dist < min_sl_dist:
+        print(f"[MIN SL] {tl_symbol}: SL dist {actual_sl_dist:.2f} < min {min_sl_dist:.2f}, expanding", flush=True)
+        if action == "buy":
+            suggested_sl = live_price - min_sl_dist
+        else:
+            suggested_sl = live_price + min_sl_dist
+        suggested_sl = quantize_price(suggested_sl, tick_size)
+    
     # ===== ENTRY VETTING GATES (deterministic, before AI) =====
     
     # Gate 1: Alert freshness (requires bar_time in payload)
@@ -1708,57 +1759,6 @@ def process_tradingview_alert(data: dict, task_id: str):
         log_alert(data, result)
         print(f"[GATE] {tl_symbol}: {slippage_reason}", flush=True)
         return result
-    
-    # Fetch live price from TradeLocker for accurate SL/TP calculation
-    live_price = get_live_price(tl_symbol)
-    if live_price <= 0:
-        result = {"status": "rejected", "reason": "Could not fetch live price from TradeLocker"}
-        log_alert(data, result)
-        return result
-    
-    MIN_SL_PCT = {
-        "GBPJPY.R": 0.003, "USDJPY.R": 0.003,
-        "US30.R": 0.003, "NAS100.R": 0.003, "SPX500.R": 0.003,
-        "XAUUSD.R": 0.005, "XPDUSD.R": 0.005, "UKOIL.R": 0.003,
-        "LVMH": 0.005, "SIEMENS": 0.005, "ALPHABET-C": 0.005, "GE": 0.005,
-    }
-    # Wider percentage-based SL fallback for when ATR can't be calculated
-    FALLBACK_SL_PCT = {
-        "GBPJPY.R": 0.010, "USDJPY.R": 0.010,
-        "XPDUSD.R": 0.020, "XAUUSD.R": 0.020, "UKOIL.R": 0.020,
-    }
-
-    print(f"[LIVE PRICE] {tl_symbol}: live_price={live_price}, webhook_price={indicator_val}", flush=True)
-    
-    # Auto-calculate SL from ATR if not provided or invalid (handles TradingView placeholder strings)
-    if suggested_sl <= 0 or abs(indicator_val - suggested_sl) < 0.01:
-        atr_sl = calculate_atr_sl(tl_symbol, action, live_price)
-        if atr_sl > 0:
-            suggested_sl = atr_sl
-            print(f"[AUTO-SL] {tl_symbol} {action}: Calculated SL from ATR(10)*3 = {suggested_sl}")
-        else:
-            # Fallback: percentage-based SL when ATR data unavailable
-            fallback_pct = FALLBACK_SL_PCT.get(tl_symbol, 0.015)
-            if action == "buy":
-                suggested_sl = live_price * (1 - fallback_pct)
-            else:
-                suggested_sl = live_price * (1 + fallback_pct)
-            print(f"[ATR FALLBACK] {tl_symbol} {action}: ATR unavailable, using {fallback_pct:.1%} fallback SL = {suggested_sl}", flush=True)
-    
-    # Round SL to symbol's tick size (broker requirement)
-    tick_size = TOP_SYMBOLS[tl_symbol].get("tick_size", 0.01)
-    suggested_sl = quantize_price(suggested_sl, tick_size)
-    
-    # Enforce minimum SL distance (prevents ATR from giving too-tight stops)
-    min_sl_dist = live_price * MIN_SL_PCT.get(tl_symbol, 0.005)
-    actual_sl_dist = abs(live_price - suggested_sl)
-    if actual_sl_dist < min_sl_dist:
-        print(f"[MIN SL] {tl_symbol}: SL dist {actual_sl_dist:.2f} < min {min_sl_dist:.2f}, expanding", flush=True)
-        if action == "buy":
-            suggested_sl = live_price - min_sl_dist
-        else:
-            suggested_sl = live_price + min_sl_dist
-        suggested_sl = quantize_price(suggested_sl, tick_size)
     
     # Validate entry against live price
     valid, reason = validate_entry(tl_symbol, action, live_price, suggested_sl)
