@@ -12,6 +12,7 @@ import re
 import sys
 import asyncio
 import threading
+import math
 from collections import deque
 from uuid import uuid4
 from datetime import datetime, timedelta
@@ -1217,14 +1218,89 @@ def get_technical_summary(tl_symbol: str) -> str:
 
 # Track positions that already have breakeven SL applied
 _be_applied_positions: set[int] = set()
+TRAILING_SL_LOCK_TRIGGER = 90.0
+TRAILING_SL_LOCK_DOLLARS = 50.0
+_trailing_stop_stages: dict[int, int] = {}
 
 # Track position info for realized P&L calculation on close
 # Maps position_id -> {"symbol": str, "side": str, "entry_price": float, "qty": float, "unrealized_pl": float}
 _position_tracker: dict[int, dict] = {}
 
+def trailing_stop_stage(unrealized_pl: float) -> int:
+    """Return 0 below breakeven, 1 for breakeven, or 2 for the profit lock."""
+    if unrealized_pl >= TRAILING_SL_LOCK_TRIGGER:
+        return 2
+    if unrealized_pl >= TRAILING_SL_BE_PROFIT:
+        return 1
+    return 0
+
+
+def calculate_profit_lock_stop(
+    tl_symbol: str, side: str, entry_price: float, quantity: float
+) -> float:
+    """Return the tick-quantized price for the configured $50 lock target."""
+    if quantity <= 0:
+        raise ValueError("quantity must be positive")
+
+    point_value = get_point_value(tl_symbol)
+    if TOP_SYMBOLS[tl_symbol].get("currency") == "EUR":
+        point_value *= EUR_USD_RATE
+    if point_value <= 0:
+        raise ValueError(f"point value must be positive for {tl_symbol}")
+
+    distance = TRAILING_SL_LOCK_DOLLARS / (quantity * point_value)
+    tick_size = TOP_SYMBOLS[tl_symbol].get("tick_size", 0.01)
+    normalized_side = side.lower()
+    if normalized_side == "buy":
+        target = quantize_price(entry_price + distance, tick_size)
+        breakeven_tick = math.ceil(entry_price / tick_size - 1e-9) * tick_size
+        return max(target, breakeven_tick)
+    if normalized_side == "sell":
+        target = quantize_price(entry_price - distance, tick_size)
+        breakeven_tick = math.floor(entry_price / tick_size + 1e-9) * tick_size
+        return min(target, breakeven_tick)
+    raise ValueError(f"unsupported position side: {side!r}")
+
+
+def _init_trailing_stop_stages() -> None:
+    """Restore successful stop stages so restarts cannot downgrade a lock."""
+    _trailing_stop_stages.clear()
+    _be_applied_positions.clear()
+    persisted = _load_state().get("trailing_stop_stages", {})
+    for position_id, stage in persisted.items():
+        try:
+            position_id = int(position_id)
+            stage = int(stage)
+        except (TypeError, ValueError):
+            continue
+        if position_id > 0 and stage in (1, 2):
+            _trailing_stop_stages[position_id] = stage
+            _be_applied_positions.add(position_id)
+
+
+def _persist_trailing_stop_stage(position_id: int, stage: int) -> None:
+    current = _trailing_stop_stages.get(position_id, 0)
+    if stage <= current:
+        return
+    _trailing_stop_stages[position_id] = stage
+    _be_applied_positions.add(position_id)
+    state = _load_state()
+    stages = state.get("trailing_stop_stages", {})
+    stages[str(position_id)] = stage
+    state["trailing_stop_stages"] = stages
+    _save_state(state)
+
+
+def _current_position_stop(pos) -> float | None:
+    for key in ("stopLoss", "stopLossPrice", "slPrice"):
+        value = _safe_float(pos.get(key))
+        if value is not None and value > 0:
+            return value
+    return None
+
+
 async def check_and_apply_trailing_stops(positions_df=None):
-    """Background task: move SL to breakeven when profitable."""
-    global _be_applied_positions
+    """Apply breakeven at +$75, then a persistent +$50 lock at +$90."""
 
     if positions_df is None:
         positions_df = get_cached_positions()
@@ -1237,24 +1313,94 @@ async def check_and_apply_trailing_stops(positions_df=None):
             unrealized_pl = float(pos.get("unrealizedPl", 0.0))
             avg_price = float(pos.get("avgPrice", 0.0))
             instrument_id = int(pos.get("tradableInstrumentId", 0))
+            stage = max(
+                trailing_stop_stage(unrealized_pl),
+                _trailing_stop_stages.get(position_id, 0),
+                1 if position_id in _be_applied_positions else 0,
+            )
+            if stage == 0:
+                continue
+            if _trailing_stop_stages.get(position_id, 0) >= stage:
+                continue
 
-            if unrealized_pl >= TRAILING_SL_BE_PROFIT:
-                if position_id in _be_applied_positions:
+            side = str(pos.get("side", "")).lower()
+
+            try:
+                current_stop = _current_position_stop(pos)
+                lock_price = None
+                tolerance = 1e-9
+                if stage == 2:
+                    if side not in ("buy", "sell"):
+                        print(f"[SL LOCK] Position {position_id}: unsupported side {side!r}", flush=True)
+                        continue
+                    tl_symbol = resolve_symbol_for_instrument(instrument_id)
+                    if tl_symbol is None:
+                        print(f"[SL LOCK] Position {position_id}: cannot resolve instrument {instrument_id}", flush=True)
+                        continue
+                    lock_price = calculate_profit_lock_stop(
+                        tl_symbol, side, avg_price, float(pos.get("qty", 0.0))
+                    )
+                    tick_size = TOP_SYMBOLS[tl_symbol].get("tick_size", 0.01)
+                    tolerance = tick_size / 2
+                elif current_stop is not None and side in ("buy", "sell"):
+                    tl_symbol = resolve_symbol_for_instrument(instrument_id)
+                    if tl_symbol is not None:
+                        try:
+                            lock_price = calculate_profit_lock_stop(
+                                tl_symbol, side, avg_price, float(pos.get("qty", 0.0))
+                            )
+                            tolerance = TOP_SYMBOLS[tl_symbol].get("tick_size", 0.01) / 2
+                        except (KeyError, TypeError, ValueError, ZeroDivisionError) as exc:
+                            print(f"[SL LOCK] Position {position_id}: cannot infer existing lock: {exc}", flush=True)
+                target_price = lock_price if stage == 2 else avg_price
+
+                if current_stop is not None and side not in ("buy", "sell"):
+                    print(f"[BE SL] Position {position_id}: cannot compare existing SL without position side", flush=True)
                     continue
 
-                try:
-                    modification_params = {
-                        "stopLossType": "absolute",
-                        "stopLoss": avg_price
-                    }
-                    success = tl.modify_position(position_id, modification_params)
-                    if success:
-                        _be_applied_positions.add(position_id)
-                        print(f"[BE SL] Position {position_id}: SL moved to BE @{avg_price}, P&L=${unrealized_pl:.2f}", flush=True)
-                    else:
-                        print(f"[BE SL] Failed to move SL to BE for position {position_id}", flush=True)
-                except Exception as e:
-                    print(f"[BE SL] Error for position {position_id}: {e}", flush=True)
+                if current_stop is not None and lock_price is not None:
+                    lock_already_present = (
+                        current_stop >= lock_price - tolerance
+                        if side == "buy"
+                        else current_stop <= lock_price + tolerance
+                    )
+                    if lock_already_present:
+                        _persist_trailing_stop_stage(position_id, 2)
+                        continue
+
+                if current_stop is not None:
+                    target_already_present = (
+                        current_stop >= target_price - tolerance
+                        if side == "buy"
+                        else current_stop <= target_price + tolerance
+                    )
+                    if target_already_present:
+                        _persist_trailing_stop_stage(position_id, stage)
+                        continue
+
+                if (
+                    _trailing_stop_stages.get(position_id, 0) >= stage
+                    or (stage == 1 and position_id in _be_applied_positions and current_stop is None)
+                ):
+                    continue
+
+                success = tl.modify_position(position_id, {
+                    "stopLossType": "absolute",
+                    "stopLoss": target_price,
+                })
+                if not success:
+                    label = "BE SL" if stage == 1 else "SL LOCK"
+                    print(f"[{label}] Failed to move stop for position {position_id}", flush=True)
+                    continue
+
+                _persist_trailing_stop_stage(position_id, stage)
+                if stage == 1:
+                    print(f"[BE SL] Position {position_id}: SL moved to BE @{avg_price}, P&L=${unrealized_pl:.2f}", flush=True)
+                else:
+                    print(f"[SL LOCK] Position {position_id}: SL moved to +$50 lock @{target_price}, P&L=${unrealized_pl:.2f}", flush=True)
+            except Exception as e:
+                label = "BE SL" if stage == 1 else "SL LOCK"
+                print(f"[{label}] Error for position {position_id}: {e}", flush=True)
 
     except Exception as e:
         print(f"[BE SL] Background task error: {e}", flush=True)
@@ -1627,6 +1773,7 @@ async def start_trailing_stop_monitor():
 
     _ai_reset_stats()
     _init_cooldown_from_state()
+    _init_trailing_stop_stages()
 
     # Session-map telemetry at startup (item 4 from round-3 brief)
     print("[SESSION MAP] Effective session configuration:", flush=True)
