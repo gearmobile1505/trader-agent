@@ -7,10 +7,12 @@ Run: pytest scripts/test_replay_gates.py -v
 
 import pytest
 import json
-import tempfile
+import importlib
 import os
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+
+import pandas as pd
 
 # Import replay functions
 import sys
@@ -242,6 +244,222 @@ class TestReplayIntegration:
         invalid = 'not json'
         parsed = parse_alert_line(invalid)
         assert parsed is None
+
+
+class StubTradeLocker:
+    def __init__(self, bid=1999.9, ask=2000.1, executions=None):
+        self.bid = bid
+        self.ask = ask
+        self.executions = pd.DataFrame() if executions is None else executions
+
+    def get_latest_bid_price(self, instrument_id):
+        return self.bid
+
+    def get_latest_asking_price(self, instrument_id):
+        return self.ask
+
+    def get_all_executions(self):
+        return self.executions
+
+    def create_order(self, **kwargs):
+        return {"id": "test-order"}
+
+
+@pytest.fixture
+def bot_module(monkeypatch, tmp_path):
+    monkeypatch.setenv("AI_TIMEOUT_SECONDS", "15")
+    monkeypatch.setenv("AI_MAX_PREDICT", "96")
+    monkeypatch.setenv("AI_MAX_CONCURRENCY", "2")
+    monkeypatch.setenv("AI_QUEUE_TIMEOUT_SECONDS", "30")
+    tradelocker = importlib.import_module("tradelocker")
+    monkeypatch.setattr(tradelocker, "TLAPI", lambda **kwargs: StubTradeLocker())
+    bot = importlib.import_module("scripts.main_cfd_5m")
+    symbols = {symbol: index + 1 for index, symbol in enumerate(bot.TOP_SYMBOLS)}
+    monkeypatch.setattr(bot, "get_instrument_id", lambda symbol: symbols[symbol])
+    monkeypatch.setattr(bot, "get_point_value", lambda symbol: 100.0)
+    monkeypatch.setattr(bot, "get_live_price", lambda symbol: 2000.0 if symbol != "XPDUSD.R" else 1000.0)
+    monkeypatch.setattr(bot, "calculate_atr_sl", lambda *args: 0.0)
+    monkeypatch.setattr(bot, "get_technical_summary", lambda symbol: "Neutral")
+    monkeypatch.setattr(bot, "is_session_active", lambda config: True)
+    monkeypatch.setattr(bot, "is_weekend_et", lambda: False)
+    monkeypatch.setattr(bot, "validate_spread", lambda symbol: (True, "OK"))
+    monkeypatch.setattr(bot, "get_cached_positions", lambda: pd.DataFrame())
+    monkeypatch.setattr(bot, "tl", StubTradeLocker())
+    monkeypatch.setattr(bot, "ALERT_LOG", str(tmp_path / "alerts.jsonl"))
+    monkeypatch.setattr(bot, "STATE_FILE", str(tmp_path / "bot_state.json"))
+    bot._POSITIONS_CACHE["last_error"] = None
+    bot._STOP_OUT_COOLDOWN.clear()
+    monkeypatch.setattr(
+        bot.ai_decider,
+        "decide",
+        lambda prompt: {
+            "decision": "DENY",
+            "confidence": 1.0,
+            "reason": "integration-test denial",
+            "latency_ms": 0,
+            "source": "test",
+        },
+    )
+    return bot
+
+
+def make_handler_alert(ticker="XAUUSD", action="buy", price=2000.0):
+    return {
+        "ticker": ticker,
+        "action": action,
+        "trend": "Neutral",
+        "indicator_value": price,
+        "suggested_sl": price - (10.0 if ticker == "XAUUSD" else 5.0),
+        "bar_time": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+class TestAlertHandlerIntegration:
+    def test_clean_alert_runs_through_gates_and_returns_decision(self, bot_module):
+        result = bot_module.process_tradingview_alert(make_handler_alert(), "test-clean")
+
+        assert result["status"] == "blocked"
+        assert result["tl_symbol"] == "XAUUSD.R"
+        assert result["technical_summary"] == "Neutral"
+
+    def test_trend_gate_veto_returns_decision(self, bot_module, monkeypatch):
+        monkeypatch.setattr(bot_module, "get_technical_summary", lambda symbol: "Strong Buy")
+        result = bot_module.process_tradingview_alert(
+            make_handler_alert(action="sell"), "test-trend-veto"
+        )
+
+        assert result["status"] == "rejected"
+        assert result["gate"] == "trend_gate"
+
+    def test_outside_session_returns_decision_with_allowed_sessions(self, bot_module, monkeypatch):
+        monkeypatch.setattr(bot_module, "is_session_active", lambda config: False)
+        result = bot_module.process_tradingview_alert(make_handler_alert(), "test-session")
+
+        assert result["status"] == "rejected"
+        assert "allowed:" in result["reason"]
+        assert result["allowed_sessions"] == bot_module.TOP_SYMBOLS["XAUUSD.R"]["sessions"]
+
+    def test_xpdusd_missing_quotes_rejects_at_slippage_gate(self, bot_module, monkeypatch):
+        monkeypatch.setattr(bot_module, "tl", StubTradeLocker(bid=0.0, ask=0.0))
+        result = bot_module.process_tradingview_alert(
+            make_handler_alert(ticker="XPDUSD", price=1000.0), "test-xpd-quotes"
+        )
+
+        assert result["status"] == "rejected"
+        assert result["gate"] == "slippage_guard"
+        assert "unavailable" in result["reason"]
+
+    def test_xpdusd_quote_error_rejects_at_slippage_gate(self, bot_module, monkeypatch):
+        broker = StubTradeLocker()
+        monkeypatch.setattr(
+            broker,
+            "get_latest_bid_price",
+            lambda instrument_id: (_ for _ in ()).throw(RuntimeError("quote timeout")),
+        )
+        monkeypatch.setattr(bot_module, "tl", broker)
+        result = bot_module.process_tradingview_alert(
+            make_handler_alert(ticker="XPDUSD", price=1000.0), "test-xpd-quote-error"
+        )
+
+        assert result["status"] == "rejected"
+        assert result["gate"] == "slippage_guard"
+        assert "quote timeout" in result["reason"]
+
+    def test_closed_loss_plus_open_loss_blocks_new_entry(self, bot_module, monkeypatch):
+        import pytz
+
+        et = pytz.timezone("America/New_York")
+        today_start = datetime.now(et).replace(hour=0, minute=1, second=0, microsecond=0)
+        close_time = today_start + timedelta(minutes=1)
+        instrument_id = bot_module.get_instrument_id("XAUUSD.R")
+        executions = pd.DataFrame([
+            {
+                "positionId": 45,
+                "tradableInstrumentId": instrument_id,
+                "createdDate": int(today_start.timestamp() * 1000),
+                "side": "buy",
+                "qty": 1.0,
+                "price": 100.0,
+            },
+            {
+                "positionId": 45,
+                "tradableInstrumentId": instrument_id,
+                "createdDate": int(close_time.timestamp() * 1000),
+                "side": "sell",
+                "qty": 1.0,
+                "price": 96.5,
+            },
+        ])
+        open_positions = pd.DataFrame([
+            {
+                "id": 99,
+                "tradableInstrumentId": bot_module.get_instrument_id("GE"),
+                "side": "buy",
+                "qty": 1.0,
+                "avgPrice": 100.0,
+                "unrealizedPl": -60.0,
+            }
+        ])
+        monkeypatch.setattr(bot_module, "get_cached_positions", lambda: open_positions)
+        monkeypatch.setattr(bot_module, "tl", StubTradeLocker(executions=executions))
+        bot_module._POSITIONS_CACHE["last_error"] = None
+        monkeypatch.setattr(bot_module.ai_decider, "decide", lambda prompt: pytest.fail("AI must not run"))
+
+        assert bot_module.compute_daily_pnl() == pytest.approx(-410.0)
+        result = bot_module.process_tradingview_alert(make_handler_alert(), "test-daily-loss")
+
+        assert result["status"] == "rejected"
+        assert result["gate"] == "daily_loss"
+        assert result["reason"].startswith("Daily loss limit hit")
+
+    def test_unavailable_realized_history_blocks_new_entry(self, bot_module, monkeypatch, capsys):
+        broker = StubTradeLocker()
+        monkeypatch.setattr(broker, "get_all_executions", lambda: None)
+        monkeypatch.setattr(bot_module, "tl", broker)
+        monkeypatch.setattr(bot_module.ai_decider, "decide", lambda prompt: pytest.fail("AI must not run"))
+
+        result = bot_module.process_tradingview_alert(make_handler_alert(), "test-history-failure")
+
+        assert result["status"] == "rejected"
+        assert result["gate"] == "daily_loss"
+        assert "unavailable" in result["reason"]
+        output = capsys.readouterr().out
+        assert "[DAILY P&L] realized=unavailable" in output
+        assert "failing closed" in output
+
+    def test_unexpected_handler_crash_is_logged_before_reraise(self, bot_module, monkeypatch):
+        monkeypatch.setattr(
+            bot_module,
+            "get_technical_summary",
+            lambda symbol: (_ for _ in ()).throw(RuntimeError("synthetic handler failure")),
+        )
+
+        with pytest.raises(RuntimeError, match="synthetic handler failure"):
+            bot_module.process_tradingview_alert(make_handler_alert(), "test-crash")
+
+        logged = json.loads(Path(bot_module.ALERT_LOG).read_text().splitlines()[-1])
+        assert logged["result"]["status"] == "error"
+        assert logged["result"]["exception_message"] == "synthetic handler failure"
+
+
+def test_cooldown_state_round_trip_and_expiration(bot_module, tmp_path):
+    bot_module._STOP_OUT_COOLDOWN.clear()
+    bot_module.record_stop_out("XAUUSD.R")
+    saved_expiry = bot_module._STOP_OUT_COOLDOWN["XAUUSD.R"]
+
+    bot_module._STOP_OUT_COOLDOWN.clear()
+    bot_module._init_cooldown_from_state()
+    active, remaining = bot_module.is_in_cooldown("XAUUSD.R")
+    assert active
+    assert 0 < remaining <= bot_module.COOLDOWN_AFTER_STOP_MINUTES * 60
+    assert bot_module._STOP_OUT_COOLDOWN["XAUUSD.R"] == saved_expiry
+
+    bot_module._STOP_OUT_COOLDOWN["XAUUSD.R"] = datetime.now().timestamp() - 1
+    active, remaining = bot_module.is_in_cooldown("XAUUSD.R")
+    assert not active
+    assert remaining is None
+    state = json.loads(Path(bot_module.STATE_FILE).read_text())
+    assert state["stop_out_cooldowns"] == {}
 
 
 if __name__ == "__main__":

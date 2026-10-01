@@ -12,6 +12,7 @@ import re
 import sys
 import asyncio
 import threading
+from collections import deque
 from uuid import uuid4
 from datetime import datetime, timedelta
 from fastapi import FastAPI, Request
@@ -489,7 +490,7 @@ def map_symbol(tv_symbol: str) -> str:
     return SYMBOL_MAP.get(base, tv_symbol)
 
 # Cache for get_all_positions to prevent TradeLocker API hammering
-_POSITIONS_CACHE: dict = {"data": None, "expires_at": 0.0}
+_POSITIONS_CACHE: dict = {"data": None, "expires_at": 0.0, "last_error": None}
 _POSITIONS_CACHE_TTL = 120.0
 
 
@@ -536,8 +537,10 @@ def get_cached_positions():
         positions = tl.get_all_positions()
         _POSITIONS_CACHE["data"] = positions
         _POSITIONS_CACHE["expires_at"] = now + _POSITIONS_CACHE_TTL
+        _POSITIONS_CACHE["last_error"] = None
         return positions
     except Exception as exc:
+        _POSITIONS_CACHE["last_error"] = str(exc)
         print(f"[POS CACHE] Fetch failed: {exc}", flush=True)
         return cached if cached is not None else pd.DataFrame()
 
@@ -549,21 +552,104 @@ def record_stop_out(tl_symbol: str):
     if ENABLE_COOLDOWN_GATE:
         expiry = datetime.now().timestamp() + COOLDOWN_AFTER_STOP_MINUTES * 60
         _STOP_OUT_COOLDOWN[tl_symbol] = expiry
+        _save_cooldown_state()
         print(f"[COOLDOWN] {tl_symbol}: stop-out recorded, blocked until {datetime.fromtimestamp(expiry).isoformat()}", flush=True)
 
 def is_in_cooldown(tl_symbol: str) -> tuple[bool, float | None]:
     """Check if symbol is in post-stop-out cooldown. Returns (in_cooldown, seconds_remaining)."""
     if not ENABLE_COOLDOWN_GATE:
         return False, None
+    now = datetime.now().timestamp()
+    if _prune_stop_out_cooldowns(now):
+        _save_cooldown_state()
     expiry = _STOP_OUT_COOLDOWN.get(tl_symbol)
     if expiry is None:
         return False, None
-    now = datetime.now().timestamp()
     if now < expiry:
         return True, expiry - now
-    # Expired, clean up
-    del _STOP_OUT_COOLDOWN[tl_symbol]
     return False, None
+
+
+# State file for persisting cooldown and daily realized P&L across restarts
+STATE_FILE = "/opt/trader-agent/scripts/bot_state.json"
+
+def _load_state() -> dict:
+    """Load persistent state from JSON file."""
+    try:
+        with open(STATE_FILE, "r") as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+def _save_state(state: dict):
+    """Save persistent state to JSON file."""
+    try:
+        with open(STATE_FILE, "w") as f:
+            json.dump(state, f)
+    except Exception as exc:
+        print(f"[STATE] Could not save state: {exc}", flush=True)
+
+def _init_cooldown_from_state():
+    """Load cooldown expiries from state file on startup."""
+    global _STOP_OUT_COOLDOWN
+    state = _load_state()
+    cooldowns = state.get("stop_out_cooldowns", {})
+    now = datetime.now().timestamp()
+    restored = {}
+    for symbol, expiry in cooldowns.items():
+        try:
+            expiry = float(expiry)
+        except (TypeError, ValueError):
+            continue
+        if expiry > now:
+            restored[symbol] = expiry
+            print(f"[COOLDOWN] Restored {symbol}: blocked until {datetime.fromtimestamp(expiry).isoformat()}", flush=True)
+    _STOP_OUT_COOLDOWN = restored
+    if restored != cooldowns:
+        _save_cooldown_state()
+
+
+def _prune_stop_out_cooldowns(now: float | None = None) -> bool:
+    """Remove expired cooldowns and report whether persistent state changed."""
+    now = datetime.now().timestamp() if now is None else now
+    active = {symbol: expiry for symbol, expiry in _STOP_OUT_COOLDOWN.items() if expiry > now}
+    changed = active != _STOP_OUT_COOLDOWN
+    if changed:
+        _STOP_OUT_COOLDOWN.clear()
+        _STOP_OUT_COOLDOWN.update(active)
+    return changed
+
+def _save_cooldown_state():
+    """Save current cooldown expiries to state file."""
+    _prune_stop_out_cooldowns()
+    state = _load_state()
+    state["stop_out_cooldowns"] = _STOP_OUT_COOLDOWN
+    _save_state(state)
+
+def _get_daily_realized_pnl() -> float:
+    """Get realized P&L for current ET day from state file."""
+    import pytz
+    et = pytz.timezone('US/Eastern')
+    now_et = datetime.now(et)
+    today_key = now_et.strftime("%Y-%m-%d")
+    state = _load_state()
+    daily = state.get("daily_realized_pnl", {})
+    return float(daily.get(today_key, 0.0))
+
+def _add_daily_realized_pnl(pnl: float):
+    """Add realized P&L for current ET day to state file."""
+    import pytz
+    et = pytz.timezone('US/Eastern')
+    now_et = datetime.now(et)
+    today_key = now_et.strftime("%Y-%m-%d")
+    state = _load_state()
+    daily = state.get("daily_realized_pnl", {})
+    daily[today_key] = daily.get(today_key, 0.0) + pnl
+    state["daily_realized_pnl"] = daily
+    # Also prune old days (keep last 30)
+    cutoff = (now_et - timedelta(days=30)).strftime("%Y-%m-%d")
+    state["daily_realized_pnl"] = {k: v for k, v in daily.items() if k >= cutoff}
+    _save_state(state)
 
 # Cache for JPY point value (USDJPY rate)
 _JPY_PV_CACHE: dict = {"value": None, "expires_at": 0.0}
@@ -701,34 +787,115 @@ def validate_spread(tl_symbol: str) -> tuple[bool, str]:
         return True, "Spread check skipped"
 
 
+def _realized_pnl_from_executions(executions_df, et_date) -> float:
+    """Match execution lots and total realized P&L for closes on an ET date."""
+    if executions_df is None:
+        raise RuntimeError("TradeLocker returned no execution history")
+    if executions_df.empty:
+        return 0.0
+
+    required = {"positionId", "tradableInstrumentId", "createdDate", "side", "qty", "price"}
+    missing = required.difference(executions_df.columns)
+    if missing:
+        raise ValueError(f"execution history missing columns: {sorted(missing)}")
+
+    symbol_by_instrument = {
+        int(get_instrument_id(symbol)): symbol for symbol in TOP_SYMBOLS
+    }
+    executions = executions_df[
+        executions_df["tradableInstrumentId"].isin(symbol_by_instrument)
+    ].copy()
+    if executions.empty:
+        return 0.0
+    if executions["positionId"].isna().any():
+        raise ValueError("execution history contains rows without positionId")
+
+    executions["createdDate"] = pd.to_numeric(executions["createdDate"], errors="coerce")
+    if executions["createdDate"].isna().any():
+        raise ValueError("execution history contains invalid createdDate values")
+    executions["time"] = pd.to_datetime(executions["createdDate"], unit="ms", utc=True).dt.tz_convert("US/Eastern")
+    executions = executions.sort_values(["positionId", "time"])
+
+    realized = 0.0
+    for (_, instrument_id), group in executions.groupby(
+        ["positionId", "tradableInstrumentId"], dropna=False
+    ):
+        symbol = symbol_by_instrument[int(instrument_id)]
+        value_per_unit = get_point_value(symbol)
+        if TOP_SYMBOLS[symbol].get("currency") == "EUR":
+            value_per_unit *= EUR_USD_RATE
+        open_lots = {"buy": deque(), "sell": deque()}
+
+        for row in group.itertuples(index=False):
+            side = str(row.side).lower()
+            if side not in open_lots:
+                raise ValueError(f"unexpected execution side {row.side!r}")
+            quantity = float(row.qty)
+            price = float(row.price)
+            if not np.isfinite(quantity) or quantity <= 0 or not np.isfinite(price):
+                raise ValueError("execution history contains invalid qty or price")
+
+            opposite = "sell" if side == "buy" else "buy"
+            while quantity > 1e-9 and open_lots[opposite]:
+                entry_quantity, entry_price = open_lots[opposite][0]
+                matched_quantity = min(quantity, entry_quantity)
+                if opposite == "buy":
+                    pnl = (price - entry_price) * matched_quantity * value_per_unit
+                else:
+                    pnl = (entry_price - price) * matched_quantity * value_per_unit
+                if row.time.date() == et_date:
+                    realized += pnl
+                quantity -= matched_quantity
+                entry_quantity -= matched_quantity
+                if entry_quantity <= 1e-9:
+                    open_lots[opposite].popleft()
+                else:
+                    open_lots[opposite][0] = (entry_quantity, entry_price)
+
+            if quantity > 1e-9:
+                open_lots[side].append((quantity, price))
+
+    return realized
+
+
 def compute_daily_pnl() -> float:
-    """Compute realized + unrealized P&L for current ET day.
-    
-    Returns total P&L in USD. Used for MAX_DAILY_LOSS gate.
+    """Compute realized + unrealized P&L for the current America/New_York day.
+
+    Returns total P&L in USD. Returns negative infinity when broker data cannot
+    be verified so the daily-loss gate rejects new entries.
     """
+    realized = None
+    unrealized = None
     try:
         import pytz
-        et = pytz.timezone('US/Eastern')
-        now_et = datetime.now(et)
-        day_start = et.localize(datetime(now_et.year, now_et.month, now_et.day, 0, 0, 0))
-        day_start_ts = day_start.timestamp()
-        
+
+        now_et = datetime.now(pytz.timezone("America/New_York"))
         positions_df = get_cached_positions()
+        if _POSITIONS_CACHE.get("last_error"):
+            raise RuntimeError(f"open-position fetch failed: {_POSITIONS_CACHE['last_error']}")
         unrealized = 0.0
         if positions_df is not None and not positions_df.empty:
-            unrealized = float(positions_df.get("unrealizedPl", pd.Series([0.0])).sum())
-        
-        # Fetch closed positions from order history for realized P&L today
-        # Note: TradeLocker doesn't have a direct "daily realized P&L" endpoint.
-        # We approximate by summing unrealized + any closed positions we can detect.
-        # For a more accurate figure, we'd need to query order history.
-        # For now, use unrealized as a floor - if unrealized alone exceeds limit, block.
-        # This is conservative (blocks earlier than true realized+unrealized).
-        
-        return unrealized
+            if "unrealizedPl" not in positions_df.columns:
+                raise ValueError("open positions missing unrealizedPl")
+            unrealized = float(pd.to_numeric(positions_df["unrealizedPl"], errors="raise").sum())
+
+        executions_df = tl.get_all_executions()
+        realized = _realized_pnl_from_executions(executions_df, now_et.date())
+        total = realized + unrealized
+        print(
+            f"[DAILY P&L] realized=${realized:.2f} unrealized=${unrealized:.2f} total=${total:.2f}",
+            flush=True,
+        )
+        return total
     except Exception as exc:
-        print(f"[DAILY P&L] Could not compute: {exc}", flush=True)
-        return 0.0
+        realized_log = f"${realized:.2f}" if realized is not None else "unavailable"
+        unrealized_log = f"${unrealized:.2f}" if unrealized is not None else "unavailable"
+        print(
+            f"[DAILY P&L] realized={realized_log} unrealized={unrealized_log} total=unverified",
+            flush=True,
+        )
+        print(f"[DAILY P&L] CRITICAL: could not verify realized/unrealized P&L; failing closed: {exc}", flush=True)
+        return float("-inf")
 
 
 def validate_alert_freshness(bar_time_str: str | None, tl_symbol: str) -> tuple[bool, str]:
@@ -803,6 +970,7 @@ def validate_slippage_guard(tl_symbol: str, action: str, entry: float, sl: float
     - Blocks entry if spread > XPDUSD_MAX_SPREAD_PCT of price
     - Logs warning if SL distance * XPDUSD_SLIPPAGE_MULTIPLE would exceed reasonable fill
     - For production: could use stop-limit order with offset
+    - FAILS CLOSED for XPDUSD.R if spread data unavailable
     
     Returns:
         (is_valid, reason)
@@ -815,7 +983,7 @@ def validate_slippage_guard(tl_symbol: str, action: str, entry: float, sl: float
         bid = tl.get_latest_bid_price(instrument_id)
         ask = tl.get_latest_asking_price(instrument_id)
         if bid <= 0 or ask <= 0:
-            return True, "Spread data unavailable"
+            return False, "Slippage guard: spread data unavailable for XPDUSD.R (fail closed)"
         
         spread = abs(ask - bid)
         spread_pct = spread / bid
@@ -834,7 +1002,7 @@ def validate_slippage_guard(tl_symbol: str, action: str, entry: float, sl: float
         return True, "OK"
     except Exception as exc:
         print(f"[SLIPPAGE GUARD] Error: {exc}", flush=True)
-        return True, "Slippage check skipped"
+        return False, f"Slippage guard: error fetching spread data for XPDUSD.R (fail closed): {exc}"
 
 
 def get_live_price(tl_symbol: str) -> float:
@@ -1049,6 +1217,10 @@ def get_technical_summary(tl_symbol: str) -> str:
 
 # Track positions that already have breakeven SL applied
 _be_applied_positions: set[int] = set()
+
+# Track position info for realized P&L calculation on close
+# Maps position_id -> {"symbol": str, "side": str, "entry_price": float, "qty": float, "unrealized_pl": float}
+_position_tracker: dict[int, dict] = {}
 
 async def check_and_apply_trailing_stops(positions_df=None):
     """Background task: move SL to breakeven when profitable."""
@@ -1454,6 +1626,23 @@ async def start_trailing_stop_monitor():
     import asyncio
 
     _ai_reset_stats()
+    _init_cooldown_from_state()
+
+    # Session-map telemetry at startup (item 4 from round-3 brief)
+    print("[SESSION MAP] Effective session configuration:", flush=True)
+    for symbol, config in TOP_SYMBOLS.items():
+        sessions = config.get("sessions", [])
+        session_windows = []
+        for s in sessions:
+            if s in SESSIONS_ET:
+                start, end = SESSIONS_ET[s]
+                if start < end:
+                    session_windows.append(f"{s}={start:02d}:00-{end:02d}:00 ET")
+                else:
+                    session_windows.append(f"{s}={start:02d}:00-{end:02d}:00 ET (overnight)")
+            else:
+                session_windows.append(f"{s}=unknown")
+        print(f"[SESSION MAP]   {symbol}: sessions={sessions} windows={session_windows}", flush=True)
     
     async def be_check_loop():
         monitor_interval = POSITION_MONITOR_INTERVAL_SECONDS
@@ -1475,24 +1664,52 @@ async def start_trailing_stop_monitor():
                 )
                 continue
 
+            global _position_tracker
+
             if positions_df is None or positions_df.empty:
                 _be_applied_positions.clear()
-                # Check for newly closed positions (stop-outs)
+                # Check for newly closed positions
                 current_ids = set()
                 if positions_df is not None:
                     current_ids = set(int(pos.get("id", 0)) for _, pos in positions_df.iterrows())
                 closed_ids = known_position_ids - current_ids
                 for pid in closed_ids:
-                    # We can't easily know the close reason from positions alone
-                    # In production, poll order history for stop fills
-                    pass
+                    # Record realized P&L for closed position
+                    pos_info = _position_tracker.pop(pid, None)
+                    if pos_info and pos_info.get("unrealized_pl") is not None:
+                        realized_pl = float(pos_info["unrealized_pl"])
+                        _add_daily_realized_pnl(realized_pl)
+                        print(f"[DAILY P&L] Position {pid} ({pos_info['symbol']}) closed: realized P&L = ${realized_pl:.2f}", flush=True)
                 known_position_ids = current_ids
+                _position_tracker.clear()
                 monitor_interval = POSITION_MONITOR_EMPTY_INTERVAL_SECONDS
                 continue
 
-            # Track position IDs for stop-out detection
+            # Track position IDs for stop-out detection and realized P&L
             current_ids = set(int(pos.get("id", 0)) for _, pos in positions_df.iterrows())
             closed_ids = known_position_ids - current_ids
+            if closed_ids:
+                for pid in closed_ids:
+                    pos_info = _position_tracker.pop(pid, None)
+                    if pos_info and pos_info.get("unrealized_pl") is not None:
+                        realized_pl = float(pos_info["unrealized_pl"])
+                        _add_daily_realized_pnl(realized_pl)
+                        print(f"[DAILY P&L] Position {pid} ({pos_info['symbol']}) closed: realized P&L = ${realized_pl:.2f}", flush=True)
+
+            # Update position tracker with current positions
+            for _, pos in positions_df.iterrows():
+                pid = int(pos.get("id", 0))
+                inst_id = int(pos.get("tradableInstrumentId", 0))
+                sym = resolve_symbol_for_instrument(inst_id)
+                if sym:
+                    _position_tracker[pid] = {
+                        "symbol": sym,
+                        "side": str(pos.get("side", "")).lower(),
+                        "entry_price": float(pos.get("avgPrice", 0.0)),
+                        "qty": float(pos.get("qty", 0.0)),
+                        "unrealized_pl": float(pos.get("unrealizedPl", 0.0)),
+                    }
+
             if closed_ids and ENABLE_COOLDOWN_GATE:
                 # Poll order history to detect stop-out closes
                 try:
@@ -1545,33 +1762,47 @@ def report_background_task_failure(task):
         print(f"[BACKGROUND WEBHOOK ERROR] {error}", flush=True)
 
 def process_tradingview_alert(data: dict, task_id: str):
+    """Run the alert handler and persist any unexpected crash before re-raising."""
+    try:
+        return _process_tradingview_alert(data, task_id)
+    except Exception as exc:
+        error_result = {
+            "status": "error",
+            "reason": f"Handler crashed: {type(exc).__name__}: {exc}",
+            "exception_type": type(exc).__name__,
+            "exception_message": str(exc),
+        }
+        log_alert(data, error_result)
+        print(f"[HANDLER CRASH] {task_id}: {type(exc).__name__}: {exc}", flush=True)
+        raise
+
+
+def _process_tradingview_alert(data: dict, task_id: str):
     """Run the blocking broker and AI workflow outside the Uvicorn event loop."""
-    
+
     # Log full raw payload for debugging
     print(f"Raw webhook payload ({task_id}): {json.dumps(data)}", flush=True)
-    
+
     action = data.get("action")  # "buy" or "sell"
     tv_ticker = data.get("ticker")
     trend_context = data.get("trend", "Unknown")
     alert_name = data.get("alert_name") or data.get("name") or data.get("alertName") or ""
-    
+
     # Handle TradingView placeholder for action (not interpolated in webhook JSON)
     if action and action.startswith("{{") and action.endswith("}}"):
-        # First try: extract from alert name (TradingView sends alert name in webhook)
         alert_lower = alert_name.lower()
         if "buy" in alert_lower or "bullish" in alert_lower or "long" in alert_lower:
             action = "buy"
         elif "sell" in alert_lower or "bearish" in alert_lower or "short" in alert_lower:
             action = "sell"
         else:
-            # Fallback: extract from trend field
             trend_lower = trend_context.lower()
             if "buy" in trend_lower or "bullish" in trend_lower:
                 action = "buy"
             elif "sell" in trend_lower or "bearish" in trend_lower:
                 action = "sell"
             else:
-                action = "buy"  # default
+                action = "buy"
     
     # Handle TradingView placeholder strings that weren't interpolated
     raw_sl = data.get("suggested_sl", 0.0)
@@ -1611,12 +1842,14 @@ def process_tradingview_alert(data: dict, task_id: str):
     
     # Session check
     if not is_session_active(TOP_SYMBOLS[tl_symbol]):
+        allowed = TOP_SYMBOLS[tl_symbol]["sessions"]
         result = {
             "status": "rejected",
-            "reason": f"Outside trading session for {tl_symbol}",
-            "allowed_sessions": TOP_SYMBOLS[tl_symbol]["sessions"]
+            "reason": f"Outside trading session for {tl_symbol} (allowed: {allowed})",
+            "allowed_sessions": allowed
         }
         log_alert(data, result)
+        print(f"[SESSION] {tl_symbol}: rejected — outside session (allowed: {allowed})", flush=True)
         return result
     
     # Technical summary check
@@ -1696,7 +1929,12 @@ def process_tradingview_alert(data: dict, task_id: str):
     # Gate 3: Daily P&L enforcement (before AI call)
     daily_pnl = compute_daily_pnl()
     if ENABLE_DAILY_LOSS_GATE and daily_pnl <= -MAX_DAILY_LOSS:
-        result = {"status": "rejected", "reason": f"Daily loss limit hit: ${daily_pnl:.2f} <= -${MAX_DAILY_LOSS:.0f}", "gate": "daily_loss"}
+        reason = (
+            f"Daily loss limit hit: ${daily_pnl:.2f} <= -${MAX_DAILY_LOSS:.0f}"
+            if np.isfinite(daily_pnl)
+            else "Daily P&L unavailable; rejecting new entry (fail closed)"
+        )
+        result = {"status": "rejected", "reason": reason, "gate": "daily_loss"}
         log_alert(data, result)
         print(f"[GATE] {tl_symbol}: Daily loss limit ${daily_pnl:.2f} blocks new entry", flush=True)
         return result
