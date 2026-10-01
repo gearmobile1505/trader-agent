@@ -226,7 +226,10 @@ TOP_SYMBOLS = {
         "point_value": 100.0,
         "min_lot": 0.01,
         "max_spread": 1.5,
-        "sessions": ["NY"],
+        # 2026-10-01: ASIA added per 60-day gated backtest.
+        # ASIA 59 trades +$151.03 PF 1.08 (only qualifying gated session).
+        # NY 46 trades −$424.37 PF 0.79; combined ASIA+NY on table for review.
+        "sessions": ["NY", "ASIA"],
         "description": "US Tech Cash (NASDAQ 100)",
         "currency": "USD",
         "tick_size": 0.01
@@ -256,7 +259,10 @@ TOP_SYMBOLS = {
         "min_lot": 0.01,
         "max_lot": 0.30,
         "max_spread": 2.0,
-        "sessions": ["NY", "EU", "ASIA", "NY_EARLY"],
+        # 2026-10-01: NY removed per 60-day gated backtest.
+        # NY 50 trades −$1,164.88 PF 0.19 (zero TP exits); combined net −$5.94.
+        # EU 56 trades +$389.92 PF 1.37; ASIA 57 trades +$641.70 PF 1.69; NY_EARLY 20 trades +$98.92 PF 1.35.
+        "sessions": ["EU", "ASIA", "NY_EARLY"],
         "description": "British Pound vs Japanese Yen",
         "currency": "USD",
         "tick_size": 0.01
@@ -275,10 +281,10 @@ TOP_SYMBOLS = {
         # At 0.30 every such setup was rejected outright.
         "max_lot": 0.40,
         "max_spread": 1.5,
-        # ASIA + EU only. Yen crosses best in the London/Tokyo overlap; the NY
-        # and pre-market windows were added on 2026-09-22 but this pair had been
-        # running ASIA-only until then, which is why it had not traded in weeks.
-        "sessions": ["ASIA", "EU"],
+        # 2026-10-01: EU removed per 60-day gated backtest.
+        # ASIA 49 trades +$113.57 PF 1.10; EU 39 trades −$351.57 PF 0.64.
+        # Combined config netted −$57.09; edge is Asia-only.
+        "sessions": ["ASIA"],
         "description": "US Dollar vs Japanese Yen",
         "currency": "USD",
         "tick_size": 0.01
