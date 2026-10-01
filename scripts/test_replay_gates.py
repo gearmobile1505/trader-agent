@@ -9,6 +9,7 @@ import pytest
 import json
 import importlib
 import os
+import asyncio
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -289,6 +290,8 @@ def bot_module(monkeypatch, tmp_path):
     monkeypatch.setattr(bot, "STATE_FILE", str(tmp_path / "bot_state.json"))
     bot._POSITIONS_CACHE["last_error"] = None
     bot._STOP_OUT_COOLDOWN.clear()
+    bot._trailing_stop_stages.clear()
+    bot._be_applied_positions.clear()
     monkeypatch.setattr(
         bot.ai_decider,
         "decide",
@@ -460,6 +463,157 @@ def test_cooldown_state_round_trip_and_expiration(bot_module, tmp_path):
     assert remaining is None
     state = json.loads(Path(bot_module.STATE_FILE).read_text())
     assert state["stop_out_cooldowns"] == {}
+
+
+class TestSecondStageStopLock:
+    def test_usd_lock_price_for_buy_and_sell(self, bot_module):
+        assert bot_module.calculate_profit_lock_stop("GE", "buy", 100.0, 1.0) == 100.5
+        assert bot_module.calculate_profit_lock_stop("GE", "sell", 100.0, 1.0) == 99.5
+
+    def test_eur_conversion_is_used_in_lock_distance(self, bot_module):
+        price = bot_module.calculate_profit_lock_stop("LVMH", "buy", 100.0, 2.0)
+
+        assert price == 100.23
+
+    def test_jpy_point_value_is_used_in_lock_distance(self, bot_module, monkeypatch):
+        monkeypatch.setattr(bot_module, "get_point_value", lambda symbol: 650.0)
+
+        buy = bot_module.calculate_profit_lock_stop("USDJPY.R", "buy", 150.0, 2.0)
+        sell = bot_module.calculate_profit_lock_stop("USDJPY.R", "sell", 150.0, 2.0)
+
+        assert buy == 150.04
+        assert sell == 149.96
+
+    def test_tick_rounding_clamps_lock_to_breakeven_or_better(self, bot_module, monkeypatch):
+        monkeypatch.setattr(bot_module, "get_point_value", lambda symbol: 1_000_000_000.0)
+
+        buy = bot_module.calculate_profit_lock_stop("GE", "buy", 100.005, 1.0)
+        sell = bot_module.calculate_profit_lock_stop("GE", "sell", 100.005, 1.0)
+
+        assert buy >= 100.005
+        assert sell <= 100.005
+
+    def test_stage_selection_preserves_breakeven_threshold(self, bot_module):
+        assert bot_module.trailing_stop_stage(74.99) == 0
+        assert bot_module.trailing_stop_stage(75.0) == 1
+        assert bot_module.trailing_stop_stage(80.0) == 1
+        assert bot_module.trailing_stop_stage(89.99) == 1
+        assert bot_module.trailing_stop_stage(90.0) == 2
+        assert bot_module.trailing_stop_stage(95.0) == 2
+
+    def test_direct_jump_moves_straight_to_lock_once(self, bot_module, monkeypatch):
+        calls = []
+        monkeypatch.setattr(bot_module, "tl", type("Broker", (), {
+            "modify_position": lambda self, position_id, params: calls.append((position_id, params)) or True
+        })())
+        monkeypatch.setattr(bot_module, "resolve_symbol_for_instrument", lambda instrument_id: "GE")
+        positions = pd.DataFrame([{
+            "id": 501,
+            "tradableInstrumentId": bot_module.get_instrument_id("GE"),
+            "side": "buy",
+            "qty": 1.0,
+            "avgPrice": 100.0,
+            "unrealizedPl": 95.0,
+        }])
+
+        asyncio.run(bot_module.check_and_apply_trailing_stops(positions))
+        asyncio.run(bot_module.check_and_apply_trailing_stops(positions))
+
+        assert len(calls) == 1
+        assert calls[0][1]["stopLoss"] == 100.5
+        assert bot_module._trailing_stop_stages[501] == 2
+
+    def test_breakeven_stage_does_not_require_lock_inputs(self, bot_module, monkeypatch):
+        calls = []
+        monkeypatch.setattr(bot_module, "tl", type("Broker", (), {
+            "modify_position": lambda self, position_id, params: calls.append((position_id, params)) or True
+        })())
+        monkeypatch.setattr(
+            bot_module,
+            "resolve_symbol_for_instrument",
+            lambda instrument_id: pytest.fail("breakeven stage must not resolve symbol"),
+        )
+        positions = pd.DataFrame([{
+            "id": 505,
+            "tradableInstrumentId": -1,
+            "side": "buy",
+            "avgPrice": 100.0,
+            "unrealizedPl": 80.0,
+        }])
+
+        asyncio.run(bot_module.check_and_apply_trailing_stops(positions))
+
+        assert calls[0][1]["stopLoss"] == 100.0
+
+    def test_breakeven_then_lock_never_downgrades_after_profit_dip(self, bot_module, monkeypatch):
+        calls = []
+        monkeypatch.setattr(bot_module, "tl", type("Broker", (), {
+            "modify_position": lambda self, position_id, params: calls.append((position_id, params)) or True
+        })())
+        monkeypatch.setattr(bot_module, "resolve_symbol_for_instrument", lambda instrument_id: "GE")
+        positions = pd.DataFrame([{
+            "id": 502,
+            "tradableInstrumentId": bot_module.get_instrument_id("GE"),
+            "side": "buy",
+            "qty": 1.0,
+            "avgPrice": 100.0,
+            "unrealizedPl": 80.0,
+        }])
+
+        asyncio.run(bot_module.check_and_apply_trailing_stops(positions))
+        positions.loc[0, "unrealizedPl"] = 95.0
+        asyncio.run(bot_module.check_and_apply_trailing_stops(positions))
+        positions.loc[0, "unrealizedPl"] = 80.0
+        asyncio.run(bot_module.check_and_apply_trailing_stops(positions))
+
+        assert [call[1]["stopLoss"] for call in calls] == [100.0, 100.5]
+        assert bot_module._trailing_stop_stages[502] == 2
+
+    def test_persisted_lock_stage_survives_restart(self, bot_module, monkeypatch):
+        calls = []
+        monkeypatch.setattr(bot_module, "tl", type("Broker", (), {
+            "modify_position": lambda self, position_id, params: calls.append((position_id, params)) or True
+        })())
+        monkeypatch.setattr(bot_module, "resolve_symbol_for_instrument", lambda instrument_id: "GE")
+        positions = pd.DataFrame([{
+            "id": 503,
+            "tradableInstrumentId": bot_module.get_instrument_id("GE"),
+            "side": "sell",
+            "qty": 1.0,
+            "avgPrice": 100.0,
+            "unrealizedPl": 95.0,
+        }])
+
+        asyncio.run(bot_module.check_and_apply_trailing_stops(positions))
+        bot_module._trailing_stop_stages.clear()
+        bot_module._be_applied_positions.clear()
+        bot_module._init_trailing_stop_stages()
+        positions.loc[0, "unrealizedPl"] = 80.0
+        asyncio.run(bot_module.check_and_apply_trailing_stops(positions))
+
+        assert [call[1]["stopLoss"] for call in calls] == [99.5]
+        assert bot_module._trailing_stop_stages[503] == 2
+
+    def test_existing_better_broker_stop_is_not_modified(self, bot_module, monkeypatch):
+        calls = []
+        monkeypatch.setattr(bot_module, "tl", type("Broker", (), {
+            "modify_position": lambda self, position_id, params: calls.append((position_id, params)) or True
+        })())
+        monkeypatch.setattr(bot_module, "resolve_symbol_for_instrument", lambda instrument_id: "GE")
+        positions = pd.DataFrame([{
+            "id": 504,
+            "tradableInstrumentId": bot_module.get_instrument_id("GE"),
+            "side": "buy",
+            "qty": 1.0,
+            "avgPrice": 100.0,
+            "unrealizedPl": 80.0,
+            "stopLoss": 101.0,
+        }])
+
+        asyncio.run(bot_module.check_and_apply_trailing_stops(positions))
+
+        assert calls == []
+        assert bot_module._trailing_stop_stages[504] == 2
 
 
 if __name__ == "__main__":
