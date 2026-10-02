@@ -10,6 +10,7 @@ import json
 import gzip
 import re
 import sys
+import time
 import asyncio
 import threading
 import math
@@ -311,6 +312,9 @@ ENABLE_COOLDOWN_GATE = True             # Block re-entry after stop-out
 COOLDOWN_AFTER_STOP_MINUTES = 60        # Cooldown period after SL hit
 ENABLE_COOLDOWN_ENTRY_CHECK = True      # Gate 4 also queries broker history directly
 COOLDOWN_HISTORY_LOOKBACK = "1D"        # Broker history window for the entry-path check
+# Order history is rate limited (TradeLocker returns 429 under repeated polling), so the
+# entry-path check shares one fetch across alerts instead of calling per alert.
+COOLDOWN_HISTORY_CACHE_TTL = 60.0
 # Order types whose fill closes a position. Verified against the live platform 2026-10-02:
 # a breakeven scratch (SL moved to entry) reports as type="stop", status="Filled", the same
 # as a full stop-out, so both must be treated as stop-exits.
@@ -554,6 +558,10 @@ def get_cached_positions():
 # Cooldown tracking for stop-outs (per symbol)
 _STOP_OUT_COOLDOWN: dict[str, float] = {}  # tl_symbol -> expiry timestamp
 
+# Stop-exit fills by instrument id, shared across alerts within a short TTL.
+_STOP_EXIT_CACHE: dict = {}
+_STOP_EXIT_FETCHED_AT = 0.0
+
 def record_stop_out(tl_symbol: str, exit_epoch: float | None = None):
     """Record a stop-out event for cooldown enforcement.
 
@@ -659,6 +667,50 @@ def _order_exit_epoch(order) -> float | None:
     return None
 
 
+def _fetch_stop_exits_by_instrument() -> dict:
+    """Fetch broker order history once and bucket stop-exit fills by instrument id."""
+    orders = tl.get_all_orders(lookback_period=COOLDOWN_HISTORY_LOOKBACK, history=True)
+    exits: dict[int, list] = {}
+    if orders is None or len(orders) == 0:
+        return exits
+
+    filled = orders[orders.get("status", "").astype(str).str.lower() == "filled"]
+    stop_fills = filled[
+        filled.get("type", "").astype(str).str.lower().isin(COOLDOWN_STOP_EXIT_ORDER_TYPES)
+    ]
+    for _, order in stop_fills.iterrows():
+        exited_at = _order_exit_epoch(order)
+        if exited_at is None:
+            continue
+        exits.setdefault(int(order.get("tradableInstrumentId", 0) or 0), []).append({
+            "order_id": str(order.get("id")),
+            "position_id": str(order.get("positionId")),
+            "type": str(order.get("type")).lower(),
+            "exited_at": exited_at,
+        })
+    return exits
+
+
+def _cached_stop_exits() -> dict:
+    """Stop-exit fills by instrument, refetched at most once per cache TTL.
+
+    TradeLocker rate limits order-history calls (429), and every alert on every symbol would
+    otherwise add one. A short cache keeps a stop-exit visible well within the multi-minute
+    cooldown window while collapsing bursts of alerts into a single fetch. Raises if the
+    fetch fails so the caller can apply its fail-open rule.
+    """
+    global _STOP_EXIT_CACHE, _STOP_EXIT_FETCHED_AT
+
+    now = time.monotonic()
+    if now - _STOP_EXIT_FETCHED_AT < COOLDOWN_HISTORY_CACHE_TTL:
+        return _STOP_EXIT_CACHE
+
+    fetched = _fetch_stop_exits_by_instrument()
+    _STOP_EXIT_CACHE = fetched
+    _STOP_EXIT_FETCHED_AT = now
+    return fetched
+
+
 def find_recent_stop_exit(tl_symbol: str, minutes: float | None = None):
     """Return the newest stop-exit for ``tl_symbol`` inside the cooldown window.
 
@@ -669,29 +721,14 @@ def find_recent_stop_exit(tl_symbol: str, minutes: float | None = None):
     """
     minutes = COOLDOWN_AFTER_STOP_MINUTES if minutes is None else minutes
     inst_id = get_instrument_id(tl_symbol)
-    orders = tl.get_all_orders(lookback_period=COOLDOWN_HISTORY_LOOKBACK, history=True)
-    if orders is None or len(orders) == 0:
-        return None
-
     cutoff = datetime.now().timestamp() - minutes * 60
+
     newest = None
-    for _, order in orders.iterrows():
-        if str(order.get("status", "")).lower() != "filled":
+    for exit_fill in _cached_stop_exits().get(inst_id, []):
+        if exit_fill["exited_at"] < cutoff:
             continue
-        if str(order.get("type", "")).lower() not in COOLDOWN_STOP_EXIT_ORDER_TYPES:
-            continue
-        if int(order.get("tradableInstrumentId", 0) or 0) != inst_id:
-            continue
-        exited_at = _order_exit_epoch(order)
-        if exited_at is None or exited_at < cutoff:
-            continue
-        if newest is None or exited_at > newest["exited_at"]:
-            newest = {
-                "order_id": str(order.get("id")),
-                "position_id": str(order.get("positionId")),
-                "type": str(order.get("type")).lower(),
-                "exited_at": exited_at,
-            }
+        if newest is None or exit_fill["exited_at"] > newest["exited_at"]:
+            newest = exit_fill
     return newest
 
 
