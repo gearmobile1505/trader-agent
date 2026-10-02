@@ -776,9 +776,47 @@ def cooldown_history(bot_module):
     def install(rows):
         broker.orders = pd.DataFrame(rows)
         broker.orders_error = None
+        # The entry-path check caches stop-exits across alerts; expire it so each test
+        # observes its own history.
+        bot_module._STOP_EXIT_CACHE.clear()
+        bot_module._STOP_EXIT_FETCHED_AT = 0.0
 
     install([])
     return install
+
+
+def test_entry_path_history_is_cached_across_alerts(bot_module, cooldown_history):
+    """Alerts must not each trigger a rate-limited order-history fetch."""
+    calls = []
+
+    def counting_get_all_orders(**kwargs):
+        calls.append(kwargs)
+        return bot_module.tl.orders
+
+    cooldown_history([make_exit_order(
+        bot_module.get_instrument_id("XAUUSD.R"), minutes_ago=5, order_id="cached",
+    )])
+    bot_module.tl.get_all_orders = counting_get_all_orders
+
+    for task in ("a", "b", "c"):
+        bot_module.process_tradingview_alert(make_handler_alert(), f"cache-{task}")
+
+    assert len(calls) == 1, f"expected one history fetch within the TTL, got {len(calls)}"
+
+
+def test_cache_expires_and_refetches(bot_module, cooldown_history):
+    cooldown_history([])
+    bot_module._STOP_EXIT_FETCHED_AT = 0.0
+
+    bot_module.cooldown_blocks_entry("XAUUSD.R")
+    first = bot_module._STOP_EXIT_FETCHED_AT
+
+    bot_module.cooldown_blocks_entry("XAUUSD.R")
+    assert bot_module._STOP_EXIT_FETCHED_AT == first  # still cached
+
+    bot_module._STOP_EXIT_FETCHED_AT -= bot_module.COOLDOWN_HISTORY_CACHE_TTL + 1
+    bot_module.cooldown_blocks_entry("XAUUSD.R")
+    assert bot_module._STOP_EXIT_FETCHED_AT > first  # refetched after TTL
 
 
 class TestEntryPathCooldown:
