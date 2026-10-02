@@ -16,7 +16,7 @@ import threading
 import math
 from collections import deque
 from uuid import uuid4
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from fastapi import FastAPI, Request
 import numpy as np
 import pandas as pd
@@ -32,6 +32,10 @@ app = FastAPI()
 
 # Alert log file
 ALERT_LOG = "/opt/trader-agent/scripts/alerts_log.jsonl"
+POSITION_PNL_LOG = os.getenv(
+    "POSITION_PNL_LOG",
+    os.path.join(os.path.dirname(ALERT_LOG), "position_pnl_log.jsonl"),
+)
 
 # AI Evaluation Configuration
 # Bound concurrent AI calls: the default asyncio thread executor allows
@@ -1443,6 +1447,19 @@ _trailing_stop_stages: dict[int, int] = {}
 # Maps position_id -> {"symbol": str, "side": str, "entry_price": float, "qty": float, "unrealized_pl": float}
 _position_tracker: dict[int, dict] = {}
 
+
+def log_position_pnl_samples(samples: list[dict]) -> None:
+    """Append one best-effort P&L sample per open position; never affect trading."""
+    if not samples:
+        return
+    timestamp = datetime.now(timezone.utc).isoformat()
+    try:
+        with open(POSITION_PNL_LOG, "a", encoding="utf-8") as log_file:
+            for sample in samples:
+                log_file.write(json.dumps({"timestamp": timestamp, **sample}) + "\n")
+    except Exception as exc:
+        print(f"[POSITION P&L LOG] Could not append samples: {exc}", flush=True)
+
 def trailing_stop_stage(unrealized_pl: float) -> int:
     """Return 0 below breakeven, 1 for breakeven, or 2 for the profit lock."""
     if unrealized_pl >= TRAILING_SL_LOCK_TRIGGER:
@@ -2064,11 +2081,17 @@ async def start_trailing_stop_monitor():
                         print(f"[DAILY P&L] Position {pid} ({pos_info['symbol']}) closed: realized P&L = ${realized_pl:.2f}", flush=True)
 
             # Update position tracker with current positions
+            pnl_samples = []
             for _, pos in positions_df.iterrows():
                 pid = int(pos.get("id", 0))
                 inst_id = int(pos.get("tradableInstrumentId", 0))
                 sym = resolve_symbol_for_instrument(inst_id)
                 if sym:
+                    pnl_samples.append({
+                        "position_id": pid,
+                        "symbol": sym,
+                        "unrealized_pnl": float(pos.get("unrealizedPl", 0.0)),
+                    })
                     _position_tracker[pid] = {
                         "symbol": sym,
                         "instrument_id": inst_id,
@@ -2077,6 +2100,7 @@ async def start_trailing_stop_monitor():
                         "qty": float(pos.get("qty", 0.0)),
                         "unrealized_pl": float(pos.get("unrealizedPl", 0.0)),
                     }
+            log_position_pnl_samples(pnl_samples)
 
             if closed_ids and ENABLE_COOLDOWN_GATE:
                 record_stop_outs_from_history(closed_infos)
