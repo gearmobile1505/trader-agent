@@ -481,6 +481,7 @@ def _build_client():
         username=os.getenv("TL_USER"),
         password=os.getenv("TL_PASS"),
         server=os.getenv("TL_SERVER"),
+        log_level="warning",
     )
 
 
