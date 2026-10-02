@@ -309,6 +309,12 @@ MAX_SL_OVERSHOOT_PCT = 100        # Max % over target risk at SL (min lot basis)
 ENABLE_TREND_GATE = True                # Reject counter-trend vs tech summary
 ENABLE_COOLDOWN_GATE = True             # Block re-entry after stop-out
 COOLDOWN_AFTER_STOP_MINUTES = 60        # Cooldown period after SL hit
+ENABLE_COOLDOWN_ENTRY_CHECK = True      # Gate 4 also queries broker history directly
+COOLDOWN_HISTORY_LOOKBACK = "1D"        # Broker history window for the entry-path check
+# Order types whose fill closes a position. Verified against the live platform 2026-10-02:
+# a breakeven scratch (SL moved to entry) reports as type="stop", status="Filled", the same
+# as a full stop-out, so both must be treated as stop-exits.
+COOLDOWN_STOP_EXIT_ORDER_TYPES = ("stop", "stop_limit")
 ENABLE_ONE_PER_SYMBOL_GATE = True       # Block same-symbol re-entry (same direction)
 ENABLE_ALERT_FRESHNESS_GATE = True      # Reject stale/future alerts
 ALERT_MAX_AGE_MINUTES = 10              # Max alert age before rejection
@@ -548,10 +554,18 @@ def get_cached_positions():
 # Cooldown tracking for stop-outs (per symbol)
 _STOP_OUT_COOLDOWN: dict[str, float] = {}  # tl_symbol -> expiry timestamp
 
-def record_stop_out(tl_symbol: str):
-    """Record a stop-out event for cooldown enforcement."""
+def record_stop_out(tl_symbol: str, exit_epoch: float | None = None):
+    """Record a stop-out event for cooldown enforcement.
+
+    ``exit_epoch`` is when the close actually filled. Anchoring the window to the fill rather
+    than to detection time keeps the cooldown honest when the monitor notices late.
+    """
     if ENABLE_COOLDOWN_GATE:
-        expiry = datetime.now().timestamp() + COOLDOWN_AFTER_STOP_MINUTES * 60
+        now = datetime.now().timestamp()
+        expiry = (now if exit_epoch is None else float(exit_epoch)) + COOLDOWN_AFTER_STOP_MINUTES * 60
+        # A late-detected close must never shorten the window, only extend it.
+        if expiry < now:
+            expiry = now + COOLDOWN_AFTER_STOP_MINUTES * 60
         _STOP_OUT_COOLDOWN[tl_symbol] = expiry
         _save_cooldown_state()
         print(f"[COOLDOWN] {tl_symbol}: stop-out recorded, blocked until {datetime.fromtimestamp(expiry).isoformat()}", flush=True)
@@ -626,6 +640,172 @@ def _save_cooldown_state():
     state = _load_state()
     state["stop_out_cooldowns"] = _STOP_OUT_COOLDOWN
     _save_state(state)
+
+
+def _order_exit_epoch(order) -> float | None:
+    """Epoch seconds at which a filled order executed, or None if it cannot be read.
+
+    TradeLocker order history carries milliseconds since the epoch. ``lastModified`` is the
+    fill time for a filled order -- ``createdDate`` is only when the order was filed, which
+    for a stop loss is when it was placed, potentially hours before it triggered.
+    """
+    for key in ("lastModified", "filledAt", "createdDate"):
+        value = _safe_float(order.get(key))
+        if value is None or value <= 0:
+            continue
+        # TradeLocker sends milliseconds (~1.8e12 today); anything above 1e11 cannot be a
+        # plausible second-valued epoch (that would be the year 5190), so divide it.
+        return value / 1000.0 if value > 1e11 else value
+    return None
+
+
+def find_recent_stop_exit(tl_symbol: str, minutes: float | None = None):
+    """Return the newest stop-exit for ``tl_symbol`` inside the cooldown window.
+
+    This queries broker order history directly so the entry path does not depend on the
+    background monitor having noticed the close first. Returns a detail dict, or None when
+    no stop-exit falls inside the window. Raises if the history fetch itself fails so the
+    caller can decide whether to fail open.
+    """
+    minutes = COOLDOWN_AFTER_STOP_MINUTES if minutes is None else minutes
+    inst_id = get_instrument_id(tl_symbol)
+    orders = tl.get_all_orders(lookback_period=COOLDOWN_HISTORY_LOOKBACK, history=True)
+    if orders is None or len(orders) == 0:
+        return None
+
+    cutoff = datetime.now().timestamp() - minutes * 60
+    newest = None
+    for _, order in orders.iterrows():
+        if str(order.get("status", "")).lower() != "filled":
+            continue
+        if str(order.get("type", "")).lower() not in COOLDOWN_STOP_EXIT_ORDER_TYPES:
+            continue
+        if int(order.get("tradableInstrumentId", 0) or 0) != inst_id:
+            continue
+        exited_at = _order_exit_epoch(order)
+        if exited_at is None or exited_at < cutoff:
+            continue
+        if newest is None or exited_at > newest["exited_at"]:
+            newest = {
+                "order_id": str(order.get("id")),
+                "position_id": str(order.get("positionId")),
+                "type": str(order.get("type")).lower(),
+                "exited_at": exited_at,
+            }
+    return newest
+
+
+def cooldown_blocks_entry(tl_symbol: str) -> tuple[bool, str | None]:
+    """Gate 4: block entry while a stop-exit cooldown is live for this symbol.
+
+    Two independent layers, and the more restrictive one wins:
+      1. the persisted/in-memory cooldown dict written by the background monitor, and
+      2. a direct query of broker order history for a stop-exit in the window.
+
+    Layer 2 is what closes the race where an alert arrives before the monitor's next poll.
+    If the history fetch fails the entry path fails OPEN, matching the standing
+    AI_FAIL_OPEN rule -- the persisted dict still applies.
+    """
+    blocked, remaining = is_in_cooldown(tl_symbol)
+    detail = f"recorded cooldown, {remaining:.0f}s remaining" if blocked else None
+
+    if not ENABLE_COOLDOWN_ENTRY_CHECK:
+        return blocked, detail
+
+    try:
+        stop_exit = find_recent_stop_exit(tl_symbol)
+    except Exception as exc:
+        print(
+            f"[COOLDOWN] history check failed, failing open for {tl_symbol}: {exc}",
+            flush=True,
+        )
+        return blocked, detail
+
+    if stop_exit is None:
+        return blocked, detail
+
+    now = datetime.now().timestamp()
+    direct_remaining = max(0.0, stop_exit["exited_at"] + COOLDOWN_AFTER_STOP_MINUTES * 60 - now)
+    if blocked and remaining is not None and remaining > direct_remaining:
+        return True, detail
+
+    return True, (
+        f"stop-exit order {stop_exit['order_id']} (position {stop_exit['position_id']}, "
+        f"{stop_exit['type']}) at "
+        f"{datetime.fromtimestamp(stop_exit['exited_at']).isoformat()}, "
+        f"{direct_remaining:.0f}s of {COOLDOWN_AFTER_STOP_MINUTES}min remaining"
+    )
+
+
+def record_stop_outs_from_history(closed_infos: dict):
+    """Monitor-side stop-out detection for positions that just disappeared.
+
+    ``closed_infos`` maps a closed position id to what the position tracker knew about it
+    (it must carry ``instrument_id``). Every close is reported one way or the other so a
+    silent miss cannot recur: a stop fill records a cooldown, anything else logs why not.
+
+    Verified against the live platform 2026-10-02: a breakeven scratch (SL moved to entry)
+    reports as type="stop", status="Filled", so it is caught by the same filter as a full
+    stop-out.
+    """
+    closed_instrument_ids = {
+        info["instrument_id"] for info in closed_infos.values() if info.get("instrument_id")
+    }
+    if not closed_instrument_ids:
+        return
+
+    try:
+        orders = tl.get_all_orders(lookback_period=COOLDOWN_HISTORY_LOOKBACK, history=True)
+    except Exception as exc:
+        print(f"[STOP-OUT DETECT] Could not check order history: {exc}", flush=True)
+        return
+
+    if orders is None or len(orders) == 0:
+        print(
+            f"[COOLDOWN] {len(closed_instrument_ids)} close(s) detected but order history was "
+            f"empty; no cooldown recorded",
+            flush=True,
+        )
+        return
+
+    filled = orders[orders.get("status", "").astype(str).str.lower() == "filled"]
+    stop_fills = filled[
+        filled.get("type", "").astype(str).str.lower().isin(COOLDOWN_STOP_EXIT_ORDER_TYPES)
+    ]
+
+    recorded = set()
+    for _, order in stop_fills.iterrows():
+        inst_id = int(order.get("tradableInstrumentId", 0) or 0)
+        if inst_id not in closed_instrument_ids:
+            continue
+        sym = resolve_symbol_for_instrument(inst_id)
+        if not sym:
+            print(
+                f"[COOLDOWN] close detected but instrument {inst_id} could not be resolved "
+                f"to a symbol; no cooldown recorded",
+                flush=True,
+            )
+            continue
+        exited_at = _order_exit_epoch(order)
+        record_stop_out(sym, exit_epoch=exited_at)
+        recorded.add(str(order.get("id")))
+        print(
+            f"[COOLDOWN] recorded for {sym} (stop fill {order.get('id')}, "
+            f"position {order.get('positionId')}, "
+            f"filled {datetime.fromtimestamp(exited_at).isoformat() if exited_at else 'unknown'})",
+            flush=True,
+        )
+
+    for _, order in filled.iterrows():
+        inst_id = int(order.get("tradableInstrumentId", 0) or 0)
+        if inst_id not in closed_instrument_ids or str(order.get("id")) in recorded:
+            continue
+        print(
+            f"[COOLDOWN] close detected for instrument {inst_id} (order {order.get('id')}) "
+            f"but NOT a stop fill — type={order.get('type')}, no cooldown recorded",
+            flush=True,
+        )
+
 
 def _get_daily_realized_pnl() -> float:
     """Get realized P&L for current ET day from state file."""
@@ -1835,6 +2015,9 @@ async def start_trailing_stop_monitor():
             # Track position IDs for stop-out detection and realized P&L
             current_ids = set(int(pos.get("id", 0)) for _, pos in positions_df.iterrows())
             closed_ids = known_position_ids - current_ids
+            # Capture what we know about a position before dropping it from the tracker, so the
+            # stop-out detection below can still map the close back to its instrument.
+            closed_infos = {pid: _position_tracker.get(pid, {}) for pid in closed_ids}
             if closed_ids:
                 for pid in closed_ids:
                     pos_info = _position_tracker.pop(pid, None)
@@ -1851,6 +2034,7 @@ async def start_trailing_stop_monitor():
                 if sym:
                     _position_tracker[pid] = {
                         "symbol": sym,
+                        "instrument_id": inst_id,
                         "side": str(pos.get("side", "")).lower(),
                         "entry_price": float(pos.get("avgPrice", 0.0)),
                         "qty": float(pos.get("qty", 0.0)),
@@ -1858,21 +2042,7 @@ async def start_trailing_stop_monitor():
                     }
 
             if closed_ids and ENABLE_COOLDOWN_GATE:
-                # Poll order history to detect stop-out closes
-                try:
-                    orders = tl.get_order_history()
-                    if orders is not None and not orders.empty:
-                        stop_fills = orders[
-                            (orders.get("status", "").astype(str).str.lower() == "filled") &
-                            (orders.get("type", "").astype(str).str.lower().isin(["stop", "stop_limit"]))
-                        ]
-                        for _, order in stop_fills.iterrows():
-                            inst_id = int(order.get("tradableInstrumentId", 0))
-                            sym = resolve_symbol_for_instrument(inst_id)
-                            if sym and inst_id in [int(pos.get("tradableInstrumentId", 0)) for _, pos in positions_df.iterrows() if int(pos.get("id", 0)) in closed_ids]:
-                                record_stop_out(sym)
-                except Exception as exc:
-                    print(f"[STOP-OUT DETECT] Could not check order history: {exc}", flush=True)
+                record_stop_outs_from_history(closed_infos)
             
             known_position_ids = current_ids
 
@@ -2138,12 +2308,13 @@ def _process_tradingview_alert(data: dict, task_id: str):
                 print(f"[GATE] {tl_symbol}: {result['reason']}", flush=True)
                 return result
         
-        # Check cooldown after stop-out
-        in_cooldown, secs = is_in_cooldown(tl_symbol)
-        if in_cooldown:
+        # Check cooldown after stop-out. Two layers (persisted dict + direct history query);
+        # the more restrictive wins, so a missed monitor poll cannot let a whipsaw re-entry in.
+        cooldown_blocked, cooldown_detail = cooldown_blocks_entry(tl_symbol)
+        if cooldown_blocked:
             result = {
                 "status": "rejected",
-                "reason": f"Post-stop-out cooldown active for {tl_symbol}: {secs:.0f}s remaining",
+                "reason": f"Post-stop-out cooldown active for {tl_symbol}: {cooldown_detail}",
                 "gate": "cooldown"
             }
             log_alert(data, result)

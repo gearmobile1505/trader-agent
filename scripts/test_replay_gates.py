@@ -252,6 +252,8 @@ class StubTradeLocker:
         self.bid = bid
         self.ask = ask
         self.executions = pd.DataFrame() if executions is None else executions
+        self.orders = pd.DataFrame()
+        self.orders_error = None
 
     def get_latest_bid_price(self, instrument_id):
         return self.bid
@@ -261,6 +263,12 @@ class StubTradeLocker:
 
     def get_all_executions(self):
         return self.executions
+
+    def get_all_orders(self, lookback_period="", start_timestamp=0, end_timestamp=0,
+                       instrument_id_filter=0, history=False):
+        if self.orders_error is not None:
+            raise self.orders_error
+        return self.orders
 
     def create_order(self, **kwargs):
         return {"id": "test-order"}
@@ -737,6 +745,236 @@ class TestSecondStageStopLock:
 
         assert calls == []
         assert bot_module._trailing_stop_stages[504] == 2
+
+
+def make_exit_order(inst_id, minutes_ago, order_type="stop", status="Filled",
+                    order_id="9001", position_id="8001", price=100.0):
+    """Synthesize a filled order row shaped like real TradeLocker order history."""
+    filled_ms = int((datetime.now(timezone.utc) - timedelta(minutes=minutes_ago)).timestamp() * 1000)
+    return {
+        "id": order_id,
+        "tradableInstrumentId": inst_id,
+        "side": "sell",
+        "type": order_type,
+        "status": status,
+        "qty": 0.1,
+        "filledQty": 0.1,
+        "avgPrice": price,
+        "price": price,
+        "positionId": position_id,
+        "createdDate": filled_ms - 60_000,
+        "lastModified": filled_ms,
+    }
+
+
+@pytest.fixture
+def cooldown_history(bot_module):
+    """Give the stub broker a controllable order history for the entry-path cooldown check."""
+    broker = bot_module.tl
+    bot_module._STOP_OUT_COOLDOWN.clear()
+
+    def install(rows):
+        broker.orders = pd.DataFrame(rows)
+        broker.orders_error = None
+
+    install([])
+    return install
+
+
+class TestEntryPathCooldown:
+    """Gate 4 must catch a stop-exit from broker history, not only from the monitor."""
+
+    def test_breakeven_stop_exit_18min_ago_blocks_entry(self, bot_module, cooldown_history):
+        cooldown_history([
+            make_exit_order(
+                bot_module.get_instrument_id("XAUUSD.R"), minutes_ago=18,
+                order_type="stop", order_id="216172782136186127",
+                position_id="216172782117670033", price=100.066,
+            )
+        ])
+
+        result = bot_module.process_tradingview_alert(make_handler_alert(), "test-be-18min")
+
+        assert result["status"] == "rejected"
+        assert result["gate"] == "cooldown"
+        assert "216172782136186127" in result["reason"]
+
+    def test_full_stop_out_18min_ago_blocks_entry(self, bot_module, cooldown_history):
+        cooldown_history([
+            make_exit_order(
+                bot_module.get_instrument_id("XAUUSD.R"), minutes_ago=18,
+                order_type="stop", order_id="216172782136247607",
+                position_id="216172782117677568", price=100.671,
+            )
+        ])
+
+        result = bot_module.process_tradingview_alert(make_handler_alert(), "test-sl-18min")
+
+        assert result["status"] == "rejected"
+        assert result["gate"] == "cooldown"
+
+    def test_stop_exit_61min_ago_does_not_block(self, bot_module, cooldown_history):
+        cooldown_history([
+            make_exit_order(
+                bot_module.get_instrument_id("XAUUSD.R"), minutes_ago=61,
+                order_type="stop", order_id="old",
+            )
+        ])
+
+        result = bot_module.process_tradingview_alert(make_handler_alert(), "test-61min")
+
+        assert result.get("gate") != "cooldown"
+        assert result["status"] == "blocked"
+
+    def test_stop_exit_on_other_symbol_does_not_block(self, bot_module, cooldown_history):
+        cooldown_history([
+            make_exit_order(
+                bot_module.get_instrument_id("USDJPY.R"), minutes_ago=18,
+                order_type="stop", order_id="other-symbol",
+            )
+        ])
+
+        result = bot_module.process_tradingview_alert(make_handler_alert(), "test-other-symbol")
+
+        assert result.get("gate") != "cooldown"
+        assert result["status"] == "blocked"
+
+    def test_cancelled_stop_order_is_not_a_stop_exit(self, bot_module, cooldown_history):
+        cooldown_history([
+            make_exit_order(
+                bot_module.get_instrument_id("XAUUSD.R"), minutes_ago=18,
+                status="Cancelled", order_id="cancelled",
+            )
+        ])
+
+        result = bot_module.process_tradingview_alert(make_handler_alert(), "test-cancelled")
+
+        assert result.get("gate") != "cooldown"
+
+    def test_history_fetch_failure_fails_open_with_warning(
+        self, bot_module, cooldown_history, capsys
+    ):
+        cooldown_history([])
+        bot_module.tl.orders_error = RuntimeError("history endpoint timeout")
+
+        result = bot_module.process_tradingview_alert(make_handler_alert(), "test-fail-open")
+
+        output = capsys.readouterr().out
+        assert "[COOLDOWN] history check failed, failing open" in output
+        assert result["status"] == "blocked"
+
+    def test_persisted_dict_still_blocks_when_history_is_empty(self, bot_module, cooldown_history):
+        cooldown_history([])
+        bot_module.record_stop_out("XAUUSD.R")
+
+        result = bot_module.process_tradingview_alert(make_handler_alert(), "test-persisted")
+
+        assert result["status"] == "rejected"
+        assert result["gate"] == "cooldown"
+
+    def test_history_layer_wins_when_it_is_more_restrictive(self, bot_module, cooldown_history):
+        # Persisted dict has 1 minute left; history shows a stop-exit 58 minutes ago, which in a
+        # 60-minute window leaves ~2 minutes. History is more restrictive, so it must win.
+        cooldown_history([
+            make_exit_order(
+                bot_module.get_instrument_id("XAUUSD.R"), minutes_ago=58, order_id="longer",
+            )
+        ])
+        bot_module._STOP_OUT_COOLDOWN.clear()
+        bot_module._STOP_OUT_COOLDOWN["XAUUSD.R"] = datetime.now().timestamp() + 60
+
+        blocked, detail = bot_module.cooldown_blocks_entry("XAUUSD.R")
+
+        assert blocked
+        assert "longer" in detail
+        assert "recorded cooldown" not in detail
+
+    def test_persisted_layer_wins_when_it_is_more_restrictive(self, bot_module, cooldown_history):
+        # Mirrored: the recorded dict still has 50 minutes, history only ~0.1 minute.
+        cooldown_history([
+            make_exit_order(
+                bot_module.get_instrument_id("XAUUSD.R"), minutes_ago=59.9, order_id="shorter",
+            )
+        ])
+        bot_module._STOP_OUT_COOLDOWN.clear()
+        bot_module._STOP_OUT_COOLDOWN["XAUUSD.R"] = datetime.now().timestamp() + 50 * 60
+
+        blocked, detail = bot_module.cooldown_blocks_entry("XAUUSD.R")
+
+        assert blocked
+        assert "recorded cooldown" in detail
+        assert "shorter" not in detail
+
+    def test_missing_history_column_fails_open(self, bot_module, cooldown_history):
+        # A history payload without the instrument column must not silently block entries.
+        cooldown_history([{"id": "x", "status": "Filled", "type": "stop"}])
+
+        result = bot_module.process_tradingview_alert(make_handler_alert(), "test-bad-shape")
+
+        assert result["status"] == "blocked"
+
+
+class TestMonitorStopOutDetection:
+    """The monitor must record breakeven scratches and stay observable."""
+
+    def test_breakeven_stop_close_is_recorded_and_persisted(self, bot_module, cooldown_history, capsys):
+        cooldown_history([
+            make_exit_order(
+                bot_module.get_instrument_id("XAUUSD.R"), minutes_ago=0,
+                order_id="216172782136186127", position_id="216172782117670033",
+            )
+        ])
+        bot_module._STOP_OUT_COOLDOWN.clear()
+
+        bot_module.record_stop_outs_from_history({
+            777: {"instrument_id": bot_module.get_instrument_id("XAUUSD.R"), "symbol": "XAUUSD.R"}
+        })
+
+        output = capsys.readouterr().out
+        assert "[COOLDOWN] recorded for XAUUSD.R (stop fill 216172782136186127" in output
+        assert bot_module.is_in_cooldown("XAUUSD.R")[0]
+        state = json.loads(Path(bot_module.STATE_FILE).read_text())
+        assert "XAUUSD.R" in state["stop_out_cooldowns"]
+
+    def test_non_stop_close_is_reported_but_not_recorded(self, bot_module, cooldown_history, capsys):
+        cooldown_history([
+            make_exit_order(
+                bot_module.get_instrument_id("XAUUSD.R"), minutes_ago=0,
+                order_type="market", order_id="manual-close",
+            )
+        ])
+        bot_module._STOP_OUT_COOLDOWN.clear()
+
+        bot_module.record_stop_outs_from_history({
+            777: {"instrument_id": bot_module.get_instrument_id("XAUUSD.R"), "symbol": "XAUUSD.R"}
+        })
+
+        output = capsys.readouterr().out
+        assert "but NOT a stop fill" in output
+        assert "type=market" in output
+        assert not bot_module.is_in_cooldown("XAUUSD.R")[0]
+
+    def test_history_failure_does_not_record(self, bot_module, cooldown_history, capsys):
+        cooldown_history([])
+        bot_module.tl.orders_error = RuntimeError("order history down")
+        bot_module._STOP_OUT_COOLDOWN.clear()
+
+        bot_module.record_stop_outs_from_history({
+            777: {"instrument_id": bot_module.get_instrument_id("XAUUSD.R")}
+        })
+
+        assert "[STOP-OUT DETECT] Could not check order history" in capsys.readouterr().out
+        assert not bot_module.is_in_cooldown("XAUUSD.R")[0]
+
+    def test_empty_history_is_reported(self, bot_module, cooldown_history, capsys):
+        cooldown_history([])
+        bot_module._STOP_OUT_COOLDOWN.clear()
+
+        bot_module.record_stop_outs_from_history({
+            777: {"instrument_id": bot_module.get_instrument_id("XAUUSD.R")}
+        })
+
+        assert "order history was empty" in capsys.readouterr().out
 
 
 if __name__ == "__main__":
