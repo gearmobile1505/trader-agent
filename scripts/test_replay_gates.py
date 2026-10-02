@@ -442,6 +442,129 @@ class TestAlertHandlerIntegration:
         assert logged["result"]["exception_message"] == "synthetic handler failure"
 
 
+PLACEHOLDER_ACTION = "{{strategy.order.action}}"
+
+
+def make_placeholder_alert(trend="Phantom Shift Buy", ticker="XAUUSD"):
+    alert = make_handler_alert(ticker=ticker)
+    alert["action"] = PLACEHOLDER_ACTION
+    alert["trend"] = trend
+    return alert
+
+
+@pytest.fixture
+def no_order_or_decider(bot_module, monkeypatch):
+    """Make the decider and broker order path fail loudly if the gate lets an alert through."""
+    calls = []
+
+    monkeypatch.setattr(
+        bot_module.ai_decider, "decide", lambda prompt: calls.append("decide")
+    )
+    monkeypatch.setattr(
+        bot_module.tl,
+        "create_order",
+        lambda **kwargs: calls.append("create_order"),
+    )
+    return calls
+
+
+@pytest.fixture
+def captured_action(bot_module, monkeypatch):
+    """Record the action that clears action parsing, then stop at the trend gate.
+
+    The trend gate is the first consumer of the resolved side, so vetoing there proves the
+    alert was parsed into buy/sell rather than rejected earlier.
+    """
+    seen = {}
+
+    def fake_trend_gate(action, tech_summary, tl_symbol):
+        seen["action"] = action
+        return False, f"captured action={action}"
+
+    monkeypatch.setattr(bot_module, "validate_trend_gate", fake_trend_gate)
+    return seen
+
+
+class TestActionParseGate:
+    """The action must resolve to buy/sell or the alert is rejected (fail closed)."""
+
+    def test_placeholder_action_resolves_buy_from_trend(self, bot_module, captured_action):
+        result = bot_module.process_tradingview_alert(
+            make_placeholder_alert(trend="Phantom Shift Buy"), "test-placeholder-buy"
+        )
+
+        assert result["gate"] == "trend_gate"
+        assert captured_action["action"] == "buy"
+
+    def test_placeholder_action_resolves_sell_from_trend(self, bot_module, captured_action):
+        result = bot_module.process_tradingview_alert(
+            make_placeholder_alert(trend="Phantom Shift Sell"), "test-placeholder-sell"
+        )
+
+        assert result["gate"] == "trend_gate"
+        assert captured_action["action"] == "sell"
+
+    def test_placeholder_action_prefers_alert_name_over_trend(
+        self, bot_module, captured_action
+    ):
+        alert = make_placeholder_alert(trend="Phantom Shift Buy")
+        alert["alert_name"] = "Phantom Shift Sell"
+
+        result = bot_module.process_tradingview_alert(alert, "test-placeholder-name")
+
+        assert result["gate"] == "trend_gate"
+        assert captured_action["action"] == "sell"
+
+    @pytest.mark.parametrize("trend", ["Unknown", "", None])
+    def test_placeholder_action_without_side_rejects(
+        self, bot_module, no_order_or_decider, trend
+    ):
+        result = bot_module.process_tradingview_alert(
+            make_placeholder_alert(trend=trend), "test-placeholder-noside"
+        )
+
+        assert result == {
+            "status": "rejected",
+            "reason": "Unresolvable action in alert payload",
+            "gate": "action_parse",
+        }
+        assert no_order_or_decider == []
+
+    @pytest.mark.parametrize("bad_action", [None, "", "   ", "buy_now", "BUYISH?", 12345])
+    def test_missing_or_garbage_action_rejects(
+        self, bot_module, no_order_or_decider, bad_action
+    ):
+        alert = make_handler_alert()
+        alert["action"] = bad_action
+        alert["trend"] = "Neutral"
+
+        result = bot_module.process_tradingview_alert(alert, "test-garbage-action")
+
+        assert result["status"] == "rejected"
+        assert result["gate"] == "action_parse"
+        assert no_order_or_decider == []
+
+    def test_rejection_is_written_to_the_alert_log(self, bot_module):
+        bot_module.process_tradingview_alert(
+            make_placeholder_alert(trend="Unknown"), "test-action-log"
+        )
+
+        logged = json.loads(Path(bot_module.ALERT_LOG).read_text().splitlines()[-1])
+        assert logged["result"]["gate"] == "action_parse"
+        assert logged["result"]["status"] == "rejected"
+
+    @pytest.mark.parametrize("action", ["buy", "sell", " BUY ", "Sell"])
+    def test_normalized_action_still_reaches_the_gates(
+        self, bot_module, captured_action, action
+    ):
+        result = bot_module.process_tradingview_alert(
+            make_handler_alert(action=action), "test-normalized"
+        )
+
+        assert result["gate"] == "trend_gate"
+        assert captured_action["action"] == action.strip().lower()
+
+
 def test_cooldown_state_round_trip_and_expiration(bot_module, tmp_path):
     bot_module._STOP_OUT_COOLDOWN.clear()
     bot_module.record_stop_out("XAUUSD.R")
