@@ -1930,13 +1930,15 @@ def _process_tradingview_alert(data: dict, task_id: str):
     # Log full raw payload for debugging
     print(f"Raw webhook payload ({task_id}): {json.dumps(data)}", flush=True)
 
-    action = data.get("action")  # "buy" or "sell"
+    raw_action = data.get("action")
     tv_ticker = data.get("ticker")
-    trend_context = data.get("trend", "Unknown")
+    trend_context = data.get("trend") or "Unknown"
     alert_name = data.get("alert_name") or data.get("name") or data.get("alertName") or ""
 
+    action = raw_action.strip().lower() if isinstance(raw_action, str) else ""
+
     # Handle TradingView placeholder for action (not interpolated in webhook JSON)
-    if action and action.startswith("{{") and action.endswith("}}"):
+    if not action or (action.startswith("{{") and action.endswith("}}")):
         alert_lower = alert_name.lower()
         if "buy" in alert_lower or "bullish" in alert_lower or "long" in alert_lower:
             action = "buy"
@@ -1948,8 +1950,22 @@ def _process_tradingview_alert(data: dict, task_id: str):
                 action = "buy"
             elif "sell" in trend_lower or "bearish" in trend_lower:
                 action = "sell"
-            else:
-                action = "buy"
+
+    # Fail closed: an alert whose direction cannot be resolved is rejected outright. It must
+    # never be defaulted to a side and carried downstream into the gates and the decider.
+    if action not in ("buy", "sell"):
+        result = {
+            "status": "rejected",
+            "reason": "Unresolvable action in alert payload",
+            "gate": "action_parse",
+        }
+        log_alert(data, result)
+        print(
+            f"[GATE] action_parse: rejected — unresolvable action "
+            f"(action={raw_action!r}, alert_name={alert_name!r}, trend={trend_context!r})",
+            flush=True,
+        )
+        return result
     
     # Handle TradingView placeholder strings that weren't interpolated
     raw_sl = data.get("suggested_sl", 0.0)
