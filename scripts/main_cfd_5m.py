@@ -304,7 +304,10 @@ MAX_DAILY_LOSS = 400.0            # Stop trading if -$400/day
 MAX_OPEN_TRADES = 3               # Max concurrent positions
 MIN_RISK_REWARD = 1.25            # Min R:R for entry
 MAX_HOLD_TIME_MINUTES = 0         # 0 = no max hold limit (rely on session-end flattening)
-MAX_SL_OVERSHOOT_PCT = 100        # Max % over target risk at SL (min lot basis)
+MAX_SL_OVERSHOOT_PCT = 25         # Max % over target risk at SL (min lot basis)
+# Tightened from 100 on 2026-10-02 after US30.R planned $152.48 of min-lot risk against a $100
+# target and passed a "100%" guard. At 25 the cap is $125 at minimum lot; TARGET_DOLLAR_RISK
+# itself is unchanged.
 
 # Entry Vetting Gates (all default ON)
 ENABLE_TREND_GATE = True                # Reject counter-trend vs tech summary
@@ -774,6 +777,82 @@ def cooldown_blocks_entry(tl_symbol: str) -> tuple[bool, str | None]:
     )
 
 
+EXIT_SLIPPAGE_MULTIPLE = 2.0      # Flag a stop fill that overshoots its SL by this much
+EXIT_RISK_MULTIPLE = 2.0          # Flag a stop fill whose realized loss exceeds design risk by this much
+
+
+def check_exit_slippage(entry_price: float | None, stop_price: float | None,
+                        fill_price: float | None, tl_symbol: str, order_id,
+                        position_id, qty: float | None = None,
+                        side: str | None = None) -> dict | None:
+    """Exit-slippage tripwire: flag stop fills that cost far more than the trade was designed to.
+
+    Observability only -- this never blocks or modifies anything. It records the event so the
+    frequency of gap-throughs can be measured before any exit-side protection (stop-limit vs
+    stop-market, thin-session entry bans) is considered.
+
+    Two independent conditions, because either alone misses real damage:
+
+    1. ``sl_distance`` -- the fill overshot the stop by more than EXIT_SLIPPAGE_MULTIPLE times
+       the SL distance, mirroring the entry-side XPDUSD_SLIPPAGE_MULTIPLE.
+    2. ``risk_multiple`` -- the fill implies a realized loss beyond EXIT_RISK_MULTIPLE times
+       TARGET_DOLLAR_RISK.
+
+    Condition 1 alone is decorative for wide-stop/min-lot trades: the 2026-10-02 US30.R fill
+    overshot by 81.07 pts against a 152.48 pt stop (0.53x) while still costing $233.55 against a
+    $100 target. The same trade also slips past audit_recent_stop_fills(), whose threshold is 1%
+    of fill price (513 pts at 51,332). The dollar measure is symbol-independent and is what
+    actually tracks the loss.
+    """
+    if None in (entry_price, stop_price, fill_price):
+        return None
+
+    entry_price = float(entry_price)
+    stop_price = float(stop_price)
+    fill_price = float(fill_price)
+    sl_dist = abs(entry_price - stop_price)
+    overshoot = abs(fill_price - stop_price)
+    if sl_dist <= 0:
+        return None
+
+    reasons = []
+    if overshoot > sl_dist * EXIT_SLIPPAGE_MULTIPLE:
+        reasons.append("sl_distance")
+
+    point_val = get_point_value(tl_symbol) if tl_symbol in TOP_SYMBOLS else None
+    if TOP_SYMBOLS.get(tl_symbol, {}).get("currency") == "EUR" and point_val is not None:
+        point_val *= EUR_USD_RATE
+    implied_loss = None
+    if qty and point_val:
+        if side == "buy":
+            loss_distance = max(entry_price - fill_price, 0.0)
+        elif side == "sell":
+            loss_distance = max(fill_price - entry_price, 0.0)
+        else:
+            loss_distance = abs(entry_price - fill_price)
+        implied_loss = loss_distance * float(qty) * float(point_val)
+        if implied_loss > TARGET_DOLLAR_RISK * EXIT_RISK_MULTIPLE:
+            reasons.append("risk_multiple")
+
+    if not reasons:
+        return None
+
+    return {
+        "order_id": str(order_id),
+        "position_id": str(position_id),
+        "tl_symbol": tl_symbol,
+        "entry_price": round(entry_price, 5),
+        "stop_price": round(stop_price, 5),
+        "fill_price": round(fill_price, 5),
+        "sl_distance": round(sl_dist, 5),
+        "overshoot": round(overshoot, 5),
+        "sl_overshoot_multiple": round(overshoot / sl_dist, 2),
+        "implied_loss": round(implied_loss, 2) if implied_loss is not None else None,
+        "risk_multiple": round(implied_loss / TARGET_DOLLAR_RISK, 2) if implied_loss else None,
+        "triggered_by": reasons,
+    }
+
+
 def record_stop_outs_from_history(closed_infos: dict):
     """Monitor-side stop-out detection for positions that just disappeared.
 
@@ -815,6 +894,13 @@ def record_stop_outs_from_history(closed_infos: dict):
         inst_id = int(order.get("tradableInstrumentId", 0) or 0)
         if inst_id not in closed_instrument_ids:
             continue
+        position_id = str(order.get("positionId"))
+        pos_info = closed_infos.get(position_id)
+        if pos_info is None:
+            pos_info = next(
+                (info for key, info in closed_infos.items() if str(key) == position_id),
+                {},
+            )
         sym = resolve_symbol_for_instrument(inst_id)
         if not sym:
             print(
@@ -832,6 +918,31 @@ def record_stop_outs_from_history(closed_infos: dict):
             f"filled {datetime.fromtimestamp(exited_at).isoformat() if exited_at else 'unknown'})",
             flush=True,
         )
+
+        slippage = check_exit_slippage(
+            pos_info.get("entry_price"),
+            _safe_float(order.get("price")),
+            _safe_float(order.get("avgPrice")),
+            sym,
+            order.get("id"),
+            order.get("positionId"),
+            qty=pos_info.get("qty"),
+            side=pos_info.get("side"),
+        )
+        if slippage:
+            print(
+                f"[EXIT SLIPPAGE] {sym}: stop fill {slippage['order_id']} filled "
+                f"{slippage['overshoot']:.2f} pts past the stop "
+                f"({slippage['sl_overshoot_multiple']}x the {slippage['sl_distance']:.2f} pt SL), "
+                f"implied loss ${slippage['implied_loss']} "
+                f"({slippage['risk_multiple']}x target) "
+                f"[{','.join(slippage['triggered_by'])}]",
+                flush=True,
+            )
+            log_alert(
+                {"event": "stop_fill", "tl_symbol": sym, "position_id": slippage["position_id"]},
+                {"status": "exit_slippage", "gate": "exit_slippage", **slippage},
+            )
 
     for _, order in filled.iterrows():
         inst_id = int(order.get("tradableInstrumentId", 0) or 0)
@@ -982,27 +1093,53 @@ def validate_sl_distance(tl_symbol: str, action: str, entry: float, sl: float) -
 
 
 def validate_spread(tl_symbol: str) -> tuple[bool, str]:
-    """Validate current spread is within symbol's max_spread tolerance."""
+    """Validate current spread is within the symbol's max_spread tolerance.
+
+    Applies to EVERY approved symbol, not just XPDUSD.R: the 2026-10-02 US30.R stop
+    gap-through (~81 pts past the stop, -$233.62) shows index CFDs fail the same way.
+
+    Fails CLOSED when the spread cannot be read, matching the XPDUSD.R slippage guard. A wide
+    or unknown spread is precisely the condition under which a stop fills far past its
+    trigger, so an unreadable spread must never read as "fine".
+    """
     if tl_symbol not in TOP_SYMBOLS:
         return False, f"Symbol {tl_symbol} not in approved list"
 
-    max_spread = TOP_SYMBOLS[tl_symbol].get("max_spread", 5.0)
+    max_spread = TOP_SYMBOLS[tl_symbol].get("max_spread")
+    if max_spread is None:
+        return False, (
+            f"Spread guard: no max_spread configured for {tl_symbol} (fail closed)"
+        )
+
     try:
         instrument_id = get_instrument_id(tl_symbol)
         bid = tl.get_latest_bid_price(instrument_id)
         ask = tl.get_latest_asking_price(instrument_id)
-        if bid <= 0 or ask <= 0:
-            return True, "Spread data unavailable, skipping check"
-
-        spread = abs(ask - bid)
-        if spread > max_spread:
-            return False, (
-                f"Spread {spread:.4f} exceeds max {max_spread} for {tl_symbol}"
-            )
-        return True, "OK"
     except Exception as exc:
         print(f"[SPREAD] Could not check spread for {tl_symbol}: {exc}", flush=True)
-        return True, "Spread check skipped"
+        return False, (
+            f"Spread guard: spread data unavailable for {tl_symbol} (fail closed): {exc}"
+        )
+
+    try:
+        bid = float(bid)
+        ask = float(ask)
+    except (TypeError, ValueError):
+        return False, (
+            f"Spread guard: spread data unavailable for {tl_symbol} (fail closed)"
+        )
+
+    if not np.isfinite(bid) or not np.isfinite(ask) or bid <= 0 or ask <= 0:
+        return False, (
+            f"Spread guard: spread data unavailable for {tl_symbol} (fail closed)"
+        )
+
+    spread = abs(ask - bid)
+    if spread > max_spread:
+        return False, (
+            f"Spread {spread:.4f} exceeds max {max_spread} for {tl_symbol}"
+        )
+    return True, "OK"
 
 
 def _realized_pnl_from_executions(executions_df, et_date) -> float:
@@ -2383,11 +2520,12 @@ def _process_tradingview_alert(data: dict, task_id: str):
         log_alert(data, result)
         return result
 
-    # Check spread is within tolerance
+    # Check spread is within tolerance (all symbols, fails closed)
     spread_valid, spread_reason = validate_spread(tl_symbol)
     if not spread_valid:
-        result = {"status": "rejected", "reason": spread_reason}
+        result = {"status": "rejected", "reason": spread_reason, "gate": "spread_guard"}
         log_alert(data, result)
+        print(f"[GATE] {tl_symbol}: {spread_reason}", flush=True)
         return result
 
     # Weekend guard: ASIA spans Sat/Sun, so the session check alone would still
