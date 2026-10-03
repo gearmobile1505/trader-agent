@@ -7,6 +7,8 @@ import pandas as pd
 import pytest
 
 from scripts.loss_study import (
+    BrokerHistoryRateLimited,
+    _fetch_history,
     excursion_from_bars,
     load_successful_alerts,
     map_alerts_to_positions,
@@ -242,3 +244,22 @@ def test_position_pnl_sampler_is_failure_safe(monkeypatch, tmp_path, capsys):
     monkeypatch.setattr(module, "POSITION_PNL_LOG", str(tmp_path / "missing" / "pnl.jsonl"))
     module.log_position_pnl_samples([{"position_id": 5, "symbol": "GE", "unrealized_pnl": 1.0}])
     assert "[POSITION P&L LOG]" in capsys.readouterr().out
+
+
+def test_history_fetch_stops_resolution_fallback_on_rate_limit():
+    class RateLimitedBroker:
+        def __init__(self):
+            self.calls = 0
+
+        def get_price_history(self, **kwargs):
+            self.calls += 1
+            raise RuntimeError("Cloudflare error 1015: You are being rate limited")
+
+    broker = RateLimitedBroker()
+    start = pd.Timestamp("2026-10-01T10:00:00Z")
+    end = start + pd.Timedelta(minutes=10)
+
+    with pytest.raises(BrokerHistoryRateLimited):
+        _fetch_history(broker, 10, start, end)
+
+    assert broker.calls == 1

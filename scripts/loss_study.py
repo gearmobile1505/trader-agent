@@ -8,6 +8,7 @@ import json
 import os
 import re
 import statistics
+import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -41,7 +42,13 @@ JPY_SYMBOLS = {"GBPJPY.R", "USDJPY.R"}
 EUR_SYMBOLS = {"LVMH", "SIEMENS"}
 FEE_COLUMNS = ("commission", "commissions", "fee", "fees", "commissionAmount")
 OUTCOME_BUCKETS = ("full_sl_loss", "breakeven_scratch", "small_win", "tp_win", "profit_lock")
+HISTORY_REQUEST_MIN_INTERVAL_SECONDS = float(os.getenv("LOSS_STUDY_REQUEST_INTERVAL", "1.0"))
 ORDER_ID_PATTERN = re.compile(r"\d{10,}")
+_last_history_request = 0.0
+
+
+class BrokerHistoryRateLimited(RuntimeError):
+    """Raised when the broker or its edge explicitly rate-limits history calls."""
 
 
 @dataclass
@@ -546,11 +553,16 @@ def _build_client():
 
 
 def _fetch_history(tl, instrument_id: int, start: pd.Timestamp, end: pd.Timestamp) -> tuple[pd.DataFrame, str]:
+    global _last_history_request
     start_ms = int(start.timestamp() * 1000)
     end_ms = int(end.timestamp() * 1000)
     errors = []
     for resolution in ("1m", "5m", "15m"):
         try:
+            elapsed = time.monotonic() - _last_history_request
+            if elapsed < HISTORY_REQUEST_MIN_INTERVAL_SECONDS:
+                time.sleep(HISTORY_REQUEST_MIN_INTERVAL_SECONDS - elapsed)
+            _last_history_request = time.monotonic()
             history = tl.get_price_history(
                 instrument_id=int(instrument_id),
                 resolution=resolution,
@@ -560,6 +572,11 @@ def _fetch_history(tl, instrument_id: int, start: pd.Timestamp, end: pd.Timestam
             if history is not None and not history.empty:
                 return history, resolution
         except Exception as exc:
+            message = str(exc).lower()
+            if "1015" in message or "rate limit" in message or "too many requests" in message:
+                raise BrokerHistoryRateLimited(
+                    "broker history rate-limited (HTTP/Cloudflare 1015); stopped further requests"
+                ) from exc
             errors.append(f"{resolution}:{type(exc).__name__}")
     raise RuntimeError("price history unavailable (" + ", ".join(errors) + ")")
 
@@ -621,6 +638,7 @@ def analyze_with_broker(alert_paths: list[Path], output_dir: Path) -> dict[str, 
     trades = []
     missing_execution_positions = 0
     missing_history_positions = 0
+    rate_limit_hit = False
     resolutions: dict[str, int] = {}
     usd_jpy_id = instrument_ids.get("USDJPY.R")
     for position_id, alert in linked.items():
@@ -694,6 +712,11 @@ def analyze_with_broker(alert_paths: list[Path], output_dir: Path) -> dict[str, 
                 "resolution": resolution,
                 "requested_quantity": alert.quantity,
             })
+        except BrokerHistoryRateLimited as exc:
+            missing_history_positions += 1
+            rate_limit_hit = True
+            print(f"[LOSS STUDY] {exc}", flush=True)
+            break
         except Exception as exc:
             missing_history_positions += 1
             print(f"[LOSS STUDY] {alert.symbol} position {position_id}: {exc}", flush=True)
@@ -715,6 +738,7 @@ def analyze_with_broker(alert_paths: list[Path], output_dir: Path) -> dict[str, 
         "analyzed_trades": len(trades),
         "missing_execution_positions": missing_execution_positions,
         "missing_price_history_positions": missing_history_positions,
+        "rate_limit_hit": rate_limit_hit,
         "price_history_resolutions": resolutions,
         "fees_available_for_all_trades": bool(trades) and all(trade["fees_available"] for trade in trades),
         "pnl_basis": "net_after_recorded_fees" if trades and all(trade["fees_available"] for trade in trades) else "gross_or_partially_fee_adjusted",
@@ -747,6 +771,7 @@ def print_report(report: dict[str, Any]) -> None:
     pnl_label = "Baseline P&L after recorded fees" if report["fees_available_for_all_trades"] else "Baseline gross/partial-fee P&L"
     print(f"{pnl_label}: ${sum(trade['net_pnl'] for trade in report['trades']):.2f}")
     print(f"Missing execution groups: {report['missing_execution_positions']}; missing price paths: {report['missing_price_history_positions']}")
+    print(f"Broker history rate limit hit: {report['rate_limit_hit']}")
     print(f"Price-history resolutions: {report['price_history_resolutions']}")
     print(f"Execution fee data available for every trade: {report['fees_available_for_all_trades']}")
     print("Outcome buckets (sample sizes):", report["study"]["bucket_counts"])
