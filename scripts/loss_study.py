@@ -539,7 +539,17 @@ def _point_values_for_bars(
 def analyze_with_broker(alert_paths: list[Path], output_dir: Path) -> dict[str, Any]:
     tl = _build_client()
     alerts, load_stats = load_successful_alerts(alert_paths)
-    orders = tl.get_all_orders(history=True)
+    if alerts:
+        start_timestamp = int(min(alert.timestamp for alert in alerts).timestamp() * 1000)
+        end_timestamp = int(datetime.now(timezone.utc).timestamp() * 1000)
+    else:
+        start_timestamp = 0
+        end_timestamp = 0
+    orders = tl.get_all_orders(
+        start_timestamp=start_timestamp,
+        end_timestamp=end_timestamp,
+        history=True,
+    )
     linked, unmatched_count = map_alerts_to_positions(alerts, orders)
     load_stats["successful_alerts"] = len(alerts)
     load_stats["unmatched_alerts"] = unmatched_count
