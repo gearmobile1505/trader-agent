@@ -326,10 +326,19 @@ def excursion_from_bars(
     point_value: float | list[float] | np.ndarray,
     entry_time: pd.Timestamp,
     exit_time: pd.Timestamp,
+    bar_seconds: int = 60,
 ) -> dict[str, Any] | None:
-    """Compute close-path, adverse, and favorable P&L from OHLC bars."""
+    """Compute excursions from full bars wholly inside the position lifetime.
+
+    Bars overlapping the entry or exit instant are excluded because OHLC cannot
+    separate pre-entry or post-exit movement from the actual position path.
+    """
     normalized = normalize_bars(bars)
-    normalized = normalized[(normalized["time"] >= entry_time) & (normalized["time"] <= exit_time)]
+    normalized["bar_close_time"] = normalized["time"] + pd.to_timedelta(bar_seconds, unit="s")
+    normalized = normalized[
+        (normalized["time"] >= entry_time)
+        & (normalized["bar_close_time"] <= exit_time)
+    ]
     if normalized.empty:
         return None
     sign = 1.0 if side == "buy" else -1.0
@@ -344,7 +353,7 @@ def excursion_from_bars(
     adverse = sign * (adverse_prices - entry_price) * quantity * point_values
     favorable = sign * (favorable_prices - entry_price) * quantity * point_values
     adverse_index = int(np.argmin(adverse))
-    path = [{"time": time, "pnl": float(pnl)} for time, pnl in zip(normalized["time"], closes)]
+    path = [{"time": time, "pnl": float(pnl)} for time, pnl in zip(normalized["bar_close_time"], closes)]
     return {
         "mae": min(0.0, float(np.min(adverse))),
         "mae_time": normalized["time"].iloc[adverse_index],
@@ -646,6 +655,7 @@ def analyze_with_broker(alert_paths: list[Path], output_dir: Path) -> dict[str, 
                 factors,
                 order_summary["entry_time"],
                 order_summary["exit_time"],
+                bar_seconds={"1m": 60, "5m": 300, "15m": 900}[resolution],
             )
             if excursion is None:
                 missing_history_positions += 1
@@ -707,6 +717,7 @@ def analyze_with_broker(alert_paths: list[Path], output_dir: Path) -> dict[str, 
         "missing_price_history_positions": missing_history_positions,
         "price_history_resolutions": resolutions,
         "fees_available_for_all_trades": bool(trades) and all(trade["fees_available"] for trade in trades),
+        "pnl_basis": "net_after_recorded_fees" if trades and all(trade["fees_available"] for trade in trades) else "gross_or_partially_fee_adjusted",
         "scratch_exit_fee_per_lot_estimate": fee_per_lot,
         "study": study,
         "time_stop_overall": overall_time,
@@ -733,7 +744,8 @@ def print_report(report: dict[str, Any]) -> None:
     print(f"Successful alerts: {report['log_stats'].get('successful_alerts', 0)}")
     print(f"Matched alerts to positions: {report['linked_positions']} (unmatched: {report['log_stats'].get('unmatched_alerts', 0)})")
     print(f"Analyzed closed trades with price paths: {report['analyzed_trades']}")
-    print(f"Baseline net P&L: ${sum(trade['net_pnl'] for trade in report['trades']):.2f}")
+    pnl_label = "Baseline P&L after recorded fees" if report["fees_available_for_all_trades"] else "Baseline gross/partial-fee P&L"
+    print(f"{pnl_label}: ${sum(trade['net_pnl'] for trade in report['trades']):.2f}")
     print(f"Missing execution groups: {report['missing_execution_positions']}; missing price paths: {report['missing_price_history_positions']}")
     print(f"Price-history resolutions: {report['price_history_resolutions']}")
     print(f"Execution fee data available for every trade: {report['fees_available_for_all_trades']}")

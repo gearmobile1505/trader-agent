@@ -115,8 +115,9 @@ def test_excursion_from_bars_computes_mae_mfe_and_path():
 
     assert result["mae"] == -5.0
     assert result["mfe"] == 4.0
-    assert result["gross_pnl_from_prices"] == 1.0
-    assert len(result["path"]) == 3
+    assert result["gross_pnl_from_prices"] == 2.0
+    assert len(result["path"]) == 2
+    assert result["path"][-1]["time"] == end
 
 
 def test_excursion_supports_dynamic_point_value_per_bar():
@@ -125,7 +126,7 @@ def test_excursion_supports_dynamic_point_value_per_bar():
         {"t": 1790848860000, "h": 102.0, "l": 98.0, "c": 102.0},
     ])
     start = pd.Timestamp("2026-10-01T10:00:00Z")
-    end = pd.Timestamp("2026-10-01T10:01:00Z")
+    end = pd.Timestamp("2026-10-01T10:02:00Z")
 
     result = excursion_from_bars(bars, "buy", 100.0, 1.0, [2.0, 3.0], start, end)
 
