@@ -55,10 +55,35 @@ def test_only_alerts_linked_to_broker_order_position_are_kept():
         {"id": "entry-order", "positionId": 77},
     ])
 
-    linked, unmatched = map_alerts_to_positions(alerts, orders)
+    linked, unmatched, fallback_matches = map_alerts_to_positions(alerts, orders)
 
     assert list(linked) == ["77"]
     assert unmatched == 1
+    assert fallback_matches == 0
+
+
+def test_alert_link_falls_back_to_nearby_filled_order_by_symbol_side_and_size():
+    from scripts.loss_study import AlertTrade
+
+    alert_time = pd.Timestamp("2026-10-01T10:00:00Z")
+    alerts = [AlertTrade("response-not-order-id", alert_time, "US30.R", "sell", 0.01)]
+    orders = pd.DataFrame([{
+        "id": "history-order-id",
+        "positionId": 88,
+        "tradableInstrumentId": 50,
+        "side": "sell",
+        "qty": 0.01,
+        "createdDate": int(alert_time.timestamp() * 1000) + 2000,
+        "status": "Filled",
+    }])
+
+    linked, unmatched, fallback_matches = map_alerts_to_positions(
+        alerts, orders, {"US30.R": 50}
+    )
+
+    assert list(linked) == ["88"]
+    assert unmatched == 0
+    assert fallback_matches == 1
 
 
 def test_position_summary_matches_execution_pnl_and_fees():

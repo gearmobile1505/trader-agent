@@ -132,22 +132,73 @@ def load_successful_alerts(paths: list[Path]) -> tuple[list[AlertTrade], dict[st
     return list(alerts.values()), stats
 
 
-def map_alerts_to_positions(alerts: list[AlertTrade], orders: pd.DataFrame) -> tuple[dict[str, AlertTrade], int]:
-    """Join successful alerts to their filled entry order and broker position id."""
+def map_alerts_to_positions(
+    alerts: list[AlertTrade],
+    orders: pd.DataFrame,
+    instrument_by_symbol: dict[str, int] | None = None,
+    time_window_minutes: int = 15,
+) -> tuple[dict[str, AlertTrade], int, int]:
+    """Join alerts by response id, then conservative instrument/side/size/time fallback."""
     required = {"id", "positionId"}
     if orders is None or orders.empty or not required.issubset(orders.columns):
-        return {}, len(alerts)
+        return {}, len(alerts), 0
     by_order_id = {
         normalize_id(row.get("id")): normalize_id(row.get("positionId"))
         for _, row in orders.iterrows()
         if normalize_id(row.get("id")) and normalize_id(row.get("positionId"))
     }
     linked = {}
-    for alert in alerts:
+    used_positions = set()
+    unmatched = []
+    for alert in sorted(alerts, key=lambda item: item.timestamp):
         position_id = by_order_id.get(alert.order_id)
-        if position_id:
+        if position_id and position_id not in used_positions:
             linked[position_id] = alert
-    return linked, len(alerts) - len(linked)
+            used_positions.add(position_id)
+        else:
+            unmatched.append(alert)
+
+    matched_by_time = 0
+    fallback_columns = {"tradableInstrumentId", "side", "qty", "createdDate", "status"}
+    if instrument_by_symbol and fallback_columns.issubset(orders.columns):
+        candidates = orders.copy()
+        candidates["_position_id"] = candidates["positionId"].map(normalize_id)
+        candidates["_time"] = pd.to_datetime(
+            pd.to_numeric(candidates["createdDate"], errors="coerce"),
+            unit="ms",
+            utc=True,
+            errors="coerce",
+        )
+        candidates["_qty"] = pd.to_numeric(candidates["qty"], errors="coerce")
+        candidates["_side"] = candidates["side"].astype(str).str.lower()
+        candidates = candidates[
+            (candidates["status"].astype(str).str.lower() == "filled")
+            & candidates["_position_id"].ne("")
+            & candidates["_time"].notna()
+        ]
+        window = pd.Timedelta(minutes=time_window_minutes)
+        for alert in unmatched:
+            instrument_id = instrument_by_symbol.get(alert.symbol)
+            if instrument_id is None:
+                continue
+            remaining = candidates[
+                (pd.to_numeric(candidates["tradableInstrumentId"], errors="coerce") == instrument_id)
+                & (candidates["_side"] == alert.action)
+                & np.isclose(candidates["_qty"], alert.quantity, rtol=0.02, atol=0.001)
+                & (~candidates["_position_id"].isin(used_positions))
+            ].copy()
+            if remaining.empty:
+                continue
+            remaining["_time_delta"] = (remaining["_time"] - alert.timestamp).abs()
+            nearest = remaining[remaining["_time_delta"] <= window].sort_values("_time_delta")
+            if nearest.empty:
+                continue
+            position_id = nearest.iloc[0]["_position_id"]
+            linked[position_id] = alert
+            used_positions.add(position_id)
+            matched_by_time += 1
+
+    return linked, len(alerts) - len(linked), matched_by_time
 
 
 def position_summary(executions: pd.DataFrame, position_id: str) -> dict[str, Any] | None:
@@ -550,12 +601,13 @@ def analyze_with_broker(alert_paths: list[Path], output_dir: Path) -> dict[str, 
         end_timestamp=end_timestamp,
         history=True,
     )
-    linked, unmatched_count = map_alerts_to_positions(alerts, orders)
-    load_stats["successful_alerts"] = len(alerts)
-    load_stats["unmatched_alerts"] = unmatched_count
-    executions = tl.get_all_executions()
     instruments = tl.get_all_instruments()
     instrument_ids = dict(zip(instruments["name"].astype(str), instruments["tradableInstrumentId"].astype(int)))
+    linked, unmatched_count, matched_by_time = map_alerts_to_positions(alerts, orders, instrument_ids)
+    load_stats["successful_alerts"] = len(alerts)
+    load_stats["unmatched_alerts"] = unmatched_count
+    load_stats["matched_by_time_fallback"] = matched_by_time
+    executions = tl.get_all_executions()
 
     trades = []
     missing_execution_positions = 0
