@@ -334,6 +334,16 @@ ENABLE_SLIPPAGE_GUARD = True            # XPDUSD.R stop-limit / spread guard
 XPDUSD_SLIPPAGE_MULTIPLE = 2.0          # Alert if fill > 2x stop distance
 XPDUSD_MAX_SPREAD_PCT = 0.005           # Block entry if spread > 0.5% of price
 
+# Same-symbol per-session loss cap (PR #7). After this many realized full-SL
+# stop-outs (each at least SESSION_LOSS_CAP_MIN_LOSS dollars of loss) on the
+# same symbol within the same session, reject further entries for that symbol
+# until the session ends. Breakeven scratches never count. Sessions are frozen
+# per SESSIONS_ET; the count is derived from broker order history and resets
+# automatically because the window starts at the current session's beginning.
+ENABLE_SESSION_LOSS_CAP = True
+SESSION_LOSS_CAP_LIMIT = 2               # stop-outs before the cap engages
+SESSION_LOSS_CAP_MIN_LOSS = 50.0         # $; losses below this never count
+
 # Session exit protection
 # A position is flattened this long before its trading session ends. Holding
 # into a close exposes the position to the illiquid gap afterwards, where the
@@ -404,6 +414,43 @@ def is_weekend_et() -> bool:
     """True Saturday/Sunday in ET. CFD markets are closed; ASIA spans the weekend."""
     import pytz
     return datetime.now(pytz.timezone('US/Eastern')).weekday() >= 5
+
+
+def current_session_start_et(symbol_config: dict) -> datetime | None:
+    """Most recent start time (ET) of the symbol's currently active session.
+
+    Returns None when the symbol is not in any enabled session right now. Used
+    by the session loss cap so the count resets at every session boundary; an
+    overnight ASIA session that started yesterday evening returns yesterday's
+    20:00 ET.
+    """
+    import pytz
+
+    et = pytz.timezone('US/Eastern')
+    now_et = datetime.now(et)
+    current = now_et.hour + now_et.minute / 60 + now_et.second / 3600
+    weekend = now_et.weekday() >= 5
+
+    starts = []
+    for session in symbol_config.get("sessions", []):
+        if weekend and session in ("NY", "NY_EARLY", "NY_MORNING"):
+            continue
+        start, end = SESSIONS_ET.get(session, (0, 24))
+        start_dt = now_et.replace(
+            hour=int(start), minute=int((start % 1) * 60), second=0, microsecond=0
+        )
+        if start < end:
+            # Same-day window.
+            if start <= current < end:
+                starts.append(start_dt)
+        else:
+            # Overnight window, e.g. ASIA 20:00 -> 06:00
+            if current >= start:
+                starts.append(start_dt)
+            elif current < end:
+                starts.append(start_dt - timedelta(days=1))
+
+    return max(starts) if starts else None
 
 
 def session_exit_info(symbol_config: dict) -> tuple[bool, float | None]:
@@ -569,6 +616,12 @@ _STOP_OUT_COOLDOWN: dict[str, float] = {}  # tl_symbol -> expiry timestamp
 _STOP_EXIT_CACHE: dict = {}
 _STOP_EXIT_FETCHED_AT = 0.0
 
+# Raw filled order history, shared across gates within the same TTL. The
+# session loss cap joins entry fills to stop-exit fills by positionId; fetching
+# once per cache window keeps rate limits under control.
+_ALL_FILLED_ORDERS_CACHE: pd.DataFrame | None = None
+_ALL_FILLED_ORDERS_FETCHED_AT = 0.0
+
 def record_stop_out(tl_symbol: str, exit_epoch: float | None = None):
     """Record a stop-out event for cooldown enforcement.
 
@@ -718,6 +771,30 @@ def _cached_stop_exits() -> dict:
     return fetched
 
 
+def _cached_all_filled_orders() -> pd.DataFrame:
+    """All filled orders in the cooldown history window, refetched at most once per TTL.
+
+    Used by the session loss cap to join entry fills to stop-exit fills by
+    positionId. Shares the cooldown history lookback so both gates read the same
+    window. Raises if the fetch fails so the caller can fail open.
+    """
+    global _ALL_FILLED_ORDERS_CACHE, _ALL_FILLED_ORDERS_FETCHED_AT
+
+    now = time.monotonic()
+    if (
+        _ALL_FILLED_ORDERS_CACHE is not None
+        and now - _ALL_FILLED_ORDERS_FETCHED_AT < COOLDOWN_HISTORY_CACHE_TTL
+    ):
+        return _ALL_FILLED_ORDERS_CACHE
+
+    orders = tl.get_all_orders(lookback_period=COOLDOWN_HISTORY_LOOKBACK, history=True)
+    if orders is None:
+        orders = pd.DataFrame()
+    _ALL_FILLED_ORDERS_CACHE = orders
+    _ALL_FILLED_ORDERS_FETCHED_AT = now
+    return orders
+
+
 def find_recent_stop_exit(tl_symbol: str, minutes: float | None = None):
     """Return the newest stop-exit for ``tl_symbol`` inside the cooldown window.
 
@@ -779,6 +856,103 @@ def cooldown_blocks_entry(tl_symbol: str) -> tuple[bool, str | None]:
         f"{datetime.fromtimestamp(stop_exit['exited_at']).isoformat()}, "
         f"{direct_remaining:.0f}s of {COOLDOWN_AFTER_STOP_MINUTES}min remaining"
     )
+
+
+def session_loss_cap_blocks_entry(tl_symbol: str) -> tuple[bool, str | None]:
+    """Reject a symbol after SESSION_LOSS_CAP_LIMIT full-SL losses in the current session.
+
+    Derives the count from the same cached broker order history the entry-path
+    cooldown uses, joined by positionId: an entry fill's side/price/qty gives
+    the position's direction and size; the stop-exit fill's avgPrice vs. the
+    entry price gives the realized loss. A stop-exit counts toward the cap only
+    when that loss is >= SESSION_LOSS_CAP_MIN_LOSS -- breakeven scratches never
+    do. The window is the symbol's currently active session per SESSIONS_ET, so
+    the cap resets automatically at each session boundary.
+
+    Fails OPEN with a loud log when history can't be fetched, consistent with
+    the cooldown entry check's deliberate fail-open behavior.
+    """
+    if not ENABLE_SESSION_LOSS_CAP:
+        return False, None
+
+    session_start = current_session_start_et(TOP_SYMBOLS.get(tl_symbol, {}))
+    if session_start is None:
+        return False, None
+
+    try:
+        orders = _cached_all_filled_orders()
+    except Exception as exc:
+        print(
+            f"[SESSION LOSS CAP] history check failed, failing open for {tl_symbol}: {exc}",
+            flush=True,
+        )
+        return False, None
+
+    if orders is None or len(orders) == 0:
+        return False, None
+
+    inst_id = get_instrument_id(tl_symbol)
+    subset = orders[pd.to_numeric(orders["tradableInstrumentId"], errors="coerce") == inst_id]
+    if subset.empty:
+        return False, None
+
+    # Entry fills by position: earliest filled entry order carries side/price/qty.
+    entries: dict[str, dict] = {}
+    for _, row in subset.iterrows():
+        if str(row.get("type", "")).lower() not in ("market", "limit"):
+            continue
+        pid = normalize_id_static(row.get("positionId"))
+        if not pid or pid in entries:
+            continue
+        entries[pid] = {
+            "side": str(row.get("side", "")).lower(),
+            "price": _safe_float(row.get("avgPrice") or row.get("price")),
+            "qty": _safe_float(row.get("filledQty") or row.get("qty")),
+        }
+
+    session_start_ts = session_start.timestamp()
+    count = 0
+    for _, row in subset.iterrows():
+        if str(row.get("type", "")).lower() not in COOLDOWN_STOP_EXIT_ORDER_TYPES:
+            continue
+        pid = normalize_id_static(row.get("positionId"))
+        entry = entries.get(pid)
+        exited_at = _order_exit_epoch(row)
+        if entry is None or exited_at is None or exited_at < session_start_ts:
+            continue
+        fill = _safe_float(row.get("avgPrice"))
+        if entry["price"] is None or entry["qty"] is None or fill is None:
+            continue
+        point_val = get_point_value(tl_symbol)
+        if TOP_SYMBOLS.get(tl_symbol, {}).get("currency") == "EUR":
+            point_val *= EUR_USD_RATE
+        if entry["side"] == "buy":
+            loss = (entry["price"] - fill) * entry["qty"] * point_val
+        else:
+            loss = (fill - entry["price"]) * entry["qty"] * point_val
+        if loss >= SESSION_LOSS_CAP_MIN_LOSS:
+            count += 1
+
+    if count >= SESSION_LOSS_CAP_LIMIT:
+        return True, (
+            f"{count} full-SL stop-outs on {tl_symbol} in current session "
+            f"(each >= ${SESSION_LOSS_CAP_MIN_LOSS:.0f}); "
+            f"cap is {SESSION_LOSS_CAP_LIMIT} until session ends"
+        )
+    return False, None
+
+
+def normalize_id_static(value) -> str:
+    """Order/position ids are large ints; normalize to a stable string form."""
+    if value is None:
+        return ""
+    try:
+        numeric = float(value)
+        if numeric.is_integer():
+            return str(int(numeric))
+    except (TypeError, ValueError):
+        pass
+    return str(value).strip()
 
 
 EXIT_SLIPPAGE_MULTIPLE = 2.0      # Flag a stop fill that overshoots its SL by this much
@@ -2518,7 +2692,21 @@ def _process_tradingview_alert(data: dict, task_id: str):
             log_alert(data, result)
             print(f"[GATE] {tl_symbol}: {result['reason']}", flush=True)
             return result
-            
+
+        # Session loss cap: block re-entry after SESSION_LOSS_CAP_LIMIT full-SL
+        # stop-outs on this symbol in the current session (PR #7). Breakeven
+        # scratches never count; the cap resets at each session boundary.
+        loss_capped, loss_cap_detail = session_loss_cap_blocks_entry(tl_symbol)
+        if loss_capped:
+            result = {
+                "status": "rejected",
+                "reason": f"Session loss cap: {loss_cap_detail}",
+                "gate": "session_loss_cap"
+            }
+            log_alert(data, result)
+            print(f"[GATE] {tl_symbol}: {result['reason']}", flush=True)
+            return result
+
     except Exception as exc:
         print(f"[POSITION CHECK] Could not check open positions/cooldown: {exc}", flush=True)
     
