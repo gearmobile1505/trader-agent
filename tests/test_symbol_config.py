@@ -12,11 +12,12 @@ from scripts.main_cfd_5m import TOP_SYMBOLS, is_session_active, map_symbol
 
 
 # --- USDJPY session coverage -------------------------------------------
-# This pair ran ASIA-only from the initial commit until 2026-09-22, so every
-# alert arriving outside 20:00-06:00 ET was rejected as "Outside trading
-# session". Order history confirms it: last filled 2026-09-18, nothing since.
-def test_usdjpy_is_asia_and_eu_only():
-    assert TOP_SYMBOLS["USDJPY.R"]["sessions"] == ["ASIA", "EU"]
+# This pair is ASIA-only per the 2026-09-30 session-map change (60-day gated
+# backtest, commit 8daf1ec). EU was removed after it lost ~$351 net over 39
+# trades; every alert arriving outside 20:00-06:00 ET is rejected as
+# "Outside trading session".
+def test_usdjpy_is_asia_only():
+    assert TOP_SYMBOLS["USDJPY.R"]["sessions"] == ["ASIA"]
 
 
 def test_usdjpy_no_longer_claims_ny_sessions():
@@ -35,15 +36,16 @@ def test_every_configured_session_name_is_known():
             )
 
 
-def test_usdjpy_session_windows_do_not_overlap():
-    """ASIA 20-06 and EU 03-11 overlap 03:00-06:00 ET."""
+def test_usdjpy_only_session_is_overnight_asia_window():
+    """USDJPY.R trades only the overnight ASIA window (20:00-06:00 ET)."""
     from scripts.main_cfd_5m import SESSIONS_ET
 
-    asia = SESSIONS_ET["ASIA"]
-    eu = SESSIONS_ET["EU"]
-    assert asia[0] > asia[1] and eu[0] < eu[1], "ASIA is overnight, EU is not"
-    # Overlap exists by design, so the pair is tradable across the handover.
-    assert asia[1] > eu[0]
+    sessions = TOP_SYMBOLS["USDJPY.R"]["sessions"]
+    assert len(sessions) == 1, "USDJPY.R is ASIA-only; a second session would extend coverage"
+    asia = SESSIONS_ET[sessions[0]]
+    assert asia[0] > asia[1], "ASIA is overnight"
+    # The window wraps midnight: 20:00 start, 06:00 end.
+    assert asia == (20, 6)
 
 
 def test_usdjpy_active_now_under_current_config():
