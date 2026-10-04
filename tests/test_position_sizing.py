@@ -11,8 +11,20 @@ from scripts import main_cfd_5m as m
 from scripts.main_cfd_5m import (
     TARGET_DOLLAR_RISK,
     TOP_SYMBOLS,
+    TP_CONFIG,
     calculate_position_size,
 )
+
+
+def test_every_symbol_tp1_is_100_dollars():
+    """PR #8: every configured take-profit target is $100; no pair left at $125."""
+    assert TP_CONFIG, "TP_CONFIG must cover every tradable symbol"
+    for symbol, cfg in TP_CONFIG.items():
+        assert cfg["tp1_dollars"] == 100, f"{symbol} tp1 is {cfg['tp1_dollars']}, expected 100"
+    # Every approved symbol must have a TP entry; a missing key falls back to
+    # the generic default in the order path, which should also be $100.
+    for symbol in TOP_SYMBOLS:
+        assert symbol in TP_CONFIG, f"{symbol} missing from TP_CONFIG"
 
 
 def test_usdjpy_max_lot_raised_to_point_four():

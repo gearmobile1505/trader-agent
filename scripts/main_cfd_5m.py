@@ -352,20 +352,23 @@ NO_ENTRY_ON_WEEKEND = True
 BLOCK_OPPOSING_SAME_SYMBOL = True
 
 # Take Profit Configuration
-# TP1 = $125 minimum (1.25x R:R on $100 risk)
+# TP1 = $100 (1.0x R:R on $100 risk). Owner-directed change 2026-10-04 (PR #8):
+# winners were stalling in the $100-$125 zone and reversing into the +$50 lock,
+# so the TP banks +$100 instead of waiting for +$125. All other risk parameters
+# unchanged.
 TP_CONFIG = {
-    "US30.R":     {"tp1_dollars": 125, "tp2_dollars": None, "trail_after_tp1": True},
-    "NAS100.R":   {"tp1_dollars": 125, "tp2_dollars": None, "trail_after_tp1": True},
-    "SPX500.R":   {"tp1_dollars": 125, "tp2_dollars": None, "trail_after_tp1": False},
-    "XAUUSD.R":   {"tp1_dollars": 125, "tp2_dollars": None, "trail_after_tp1": False},
-    "XPDUSD.R":   {"tp1_dollars": 125, "tp2_dollars": None, "trail_after_tp1": False},
-    "UKOIL.R":    {"tp1_dollars": 125, "tp2_dollars": None, "trail_after_tp1": False},
-    "LVMH":       {"tp1_dollars": 125, "tp2_dollars": None, "trail_after_tp1": True},
-    "SIEMENS":    {"tp1_dollars": 125, "tp2_dollars": None, "trail_after_tp1": True},
-    "ALPHABET-C": {"tp1_dollars": 125, "tp2_dollars": None, "trail_after_tp1": True},
-    "GE":         {"tp1_dollars": 125, "tp2_dollars": None, "trail_after_tp1": True},
-    "GBPJPY.R":   {"tp1_dollars": 125, "tp2_dollars": None, "trail_after_tp1": True},
-    "USDJPY.R":   {"tp1_dollars": 125, "tp2_dollars": None, "trail_after_tp1": True},
+    "US30.R":     {"tp1_dollars": 100, "tp2_dollars": None, "trail_after_tp1": True},
+    "NAS100.R":   {"tp1_dollars": 100, "tp2_dollars": None, "trail_after_tp1": True},
+    "SPX500.R":   {"tp1_dollars": 100, "tp2_dollars": None, "trail_after_tp1": False},
+    "XAUUSD.R":   {"tp1_dollars": 100, "tp2_dollars": None, "trail_after_tp1": False},
+    "XPDUSD.R":   {"tp1_dollars": 100, "tp2_dollars": None, "trail_after_tp1": False},
+    "UKOIL.R":    {"tp1_dollars": 100, "tp2_dollars": None, "trail_after_tp1": False},
+    "LVMH":       {"tp1_dollars": 100, "tp2_dollars": None, "trail_after_tp1": True},
+    "SIEMENS":    {"tp1_dollars": 100, "tp2_dollars": None, "trail_after_tp1": True},
+    "ALPHABET-C": {"tp1_dollars": 100, "tp2_dollars": None, "trail_after_tp1": True},
+    "GE":         {"tp1_dollars": 100, "tp2_dollars": None, "trail_after_tp1": True},
+    "GBPJPY.R":   {"tp1_dollars": 100, "tp2_dollars": None, "trail_after_tp1": True},
+    "USDJPY.R":   {"tp1_dollars": 100, "tp2_dollars": None, "trail_after_tp1": True},
 }
 
 # Session time ranges (ET)
@@ -2580,7 +2583,7 @@ def _process_tradingview_alert(data: dict, task_id: str):
     # The payload is serialised with json.dumps so that a quote character in a
     # TradingView-supplied field (trend, alert name) cannot break out of the
     # JSON literal in the prompt.
-    actual_rr = TP_CONFIG.get(tl_symbol, {}).get("tp1_dollars", 125) / TARGET_DOLLAR_RISK
+    actual_rr = TP_CONFIG.get(tl_symbol, {}).get("tp1_dollars", 100) / TARGET_DOLLAR_RISK
     ai_payload = {
         "symbol": tv_ticker,
         "tl_symbol": tl_symbol,
@@ -2665,7 +2668,7 @@ def _process_tradingview_alert(data: dict, task_id: str):
 
             # Calculate take profit price based on TP config
             tp_config = TP_CONFIG.get(tl_symbol, {})
-            tp1_dollars = tp_config.get("tp1_dollars", 150)
+            tp1_dollars = tp_config.get("tp1_dollars", 100)
             tp2_dollars = tp_config.get("tp2_dollars")
             
             # Convert TP dollars to price distance
