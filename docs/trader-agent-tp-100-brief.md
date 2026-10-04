@@ -4,6 +4,11 @@ Owner-directed change (2026-10-04). This modifies a frozen risk parameter
 ($125 TP) on the owner's explicit instruction after reviewing the evidence
 below. All other risk parameters stay frozen.
 
+Owner's intent (clarified): this is a **strategy change, not a test**.
+Move the global TP target to $100 so more trades close in profit. The
+replay numbers below are for the owner's merge review — implement the
+change and report the numbers honestly either way.
+
 ## Owner's evidence
 
 - Owner observation: many trades reach +$100 unrealized and then reverse
@@ -28,7 +33,7 @@ or equivalent — and change every occurrence. No symbol is exempt.
 - Sizing formula, $100 target risk, $400 daily-loss gate, sessions, and
   all entry-vetting gates are untouched.
 
-## Required evidence before merge (replay gate)
+## Required evidence with the implementation (for owner review)
 
 Run a replay over `alerts_log.jsonl` (and broker history where needed)
 comparing TP=$100 vs TP=$125 and post in this PR:
@@ -36,11 +41,12 @@ comparing TP=$100 vs TP=$125 and post in this PR:
 1. Count of historical trades that touched +$100 unrealized and then
    failed to reach +$125 (the owner's claimed population).
 2. Count of historical trades that reached +$125 (the population that
-   loses $25 each under the new TP).
+   gives up $25 each under the new TP).
 3. Net P&L delta of TP=$100 vs TP=$125 across the replay window.
 
-If the replay shows the change is net negative, say so plainly with the
-numbers instead of implementing — the owner decides with evidence.
+Implement the $100 TP regardless and report all three numbers honestly,
+including if the replay is net negative — the owner reviews the numbers
+at merge time.
 
 ## Tests
 
