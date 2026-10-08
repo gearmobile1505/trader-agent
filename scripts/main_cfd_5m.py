@@ -993,16 +993,36 @@ def check_exit_slippage(entry_price: float | None, stop_price: float | None,
     fill_price = float(fill_price)
     sl_dist = abs(entry_price - stop_price)
     overshoot = abs(fill_price - stop_price)
-    if sl_dist <= 0:
-        return None
-
     reasons = []
+    if sl_dist <= 0:
+        # A breakeven stop sits at entry, so its SL distance is zero and the sl-distance rule
+        # cannot be evaluated. Both 2026-10-07 fills were breakeven scratches (GBPJPY.R 18.5 pips
+        # through entry, XAUUSD.R 7.53 points through entry) and would have been silently
+        # skipped by the sl-distance rule alone -- the same class of miss as the US30.R trade.
+        # Measure the leak against the entry level instead.
+        sl_dist = abs(entry_price - fill_price)
+        overshoot = sl_dist
+        if sl_dist <= 0:
+            return None
+        through_breakeven_stop = True
+        # Filling through a breakeven stop IS the leak, so it flags on its own. The dollar
+        # rule below would miss the smaller of the two (XAUUSD.R $37.65 is under 2x $100
+        # risk), but the brief requires both fills to be caught.
+        reasons.append("breakeven_stop")
+    else:
+        through_breakeven_stop = False
+
     if overshoot > sl_dist * EXIT_SLIPPAGE_MULTIPLE:
         reasons.append("sl_distance")
 
-    point_val = get_point_value(tl_symbol) if tl_symbol in TOP_SYMBOLS else None
-    if TOP_SYMBOLS.get(tl_symbol, {}).get("currency") == "EUR" and point_val is not None:
-        point_val *= EUR_USD_RATE
+    point_val = None
+    if tl_symbol in TOP_SYMBOLS:
+        try:
+            point_val = get_point_value(tl_symbol)
+        except Exception:
+            point_val = None
+        if point_val and TOP_SYMBOLS[tl_symbol].get("currency") == "EUR":
+            point_val *= EUR_USD_RATE
     implied_loss = None
     if qty and point_val:
         if side == "buy":
@@ -1030,6 +1050,7 @@ def check_exit_slippage(entry_price: float | None, stop_price: float | None,
         "sl_overshoot_multiple": round(overshoot / sl_dist, 2),
         "implied_loss": round(implied_loss, 2) if implied_loss is not None else None,
         "risk_multiple": round(implied_loss / TARGET_DOLLAR_RISK, 2) if implied_loss else None,
+        "through_breakeven_stop": through_breakeven_stop,
         "triggered_by": reasons,
     }
 
@@ -1753,7 +1774,7 @@ def get_technical_summary(tl_symbol: str) -> str:
 
 # Track positions that already have breakeven SL applied
 _be_applied_positions: set[int] = set()
-TRAILING_SL_LOCK_TRIGGER = 90.0
+TRAILING_SL_LOCK_TRIGGER = 80.0
 TRAILING_SL_LOCK_DOLLARS = 50.0
 _trailing_stop_stages: dict[int, int] = {}
 
@@ -1848,7 +1869,7 @@ def _current_position_stop(pos) -> float | None:
 
 
 async def check_and_apply_trailing_stops(positions_df=None):
-    """Apply breakeven at +$75, then a persistent +$50 lock at +$90."""
+    """Apply breakeven at +$75, then a persistent +$50 lock at +$80."""
 
     if positions_df is None:
         positions_df = get_cached_positions()

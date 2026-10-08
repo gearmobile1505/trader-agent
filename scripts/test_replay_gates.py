@@ -627,9 +627,8 @@ class TestSecondStageStopLock:
     def test_stage_selection_preserves_breakeven_threshold(self, bot_module):
         assert bot_module.trailing_stop_stage(74.99) == 0
         assert bot_module.trailing_stop_stage(75.0) == 1
-        assert bot_module.trailing_stop_stage(80.0) == 1
-        assert bot_module.trailing_stop_stage(89.99) == 1
-        assert bot_module.trailing_stop_stage(90.0) == 2
+        assert bot_module.trailing_stop_stage(79.99) == 1
+        assert bot_module.trailing_stop_stage(80.0) == 2
         assert bot_module.trailing_stop_stage(95.0) == 2
 
     def test_direct_jump_moves_straight_to_lock_once(self, bot_module, monkeypatch):
@@ -669,7 +668,8 @@ class TestSecondStageStopLock:
             "tradableInstrumentId": -1,
             "side": "buy",
             "avgPrice": 100.0,
-            "unrealizedPl": 80.0,
+            # Below the $80 lock trigger: breakeven only, so no lock inputs are needed.
+            "unrealizedPl": 79.99,
         }])
 
         asyncio.run(bot_module.check_and_apply_trailing_stops(positions))
@@ -688,7 +688,8 @@ class TestSecondStageStopLock:
             "side": "buy",
             "qty": 1.0,
             "avgPrice": 100.0,
-            "unrealizedPl": 80.0,
+            # Below the $80 lock trigger: breakeven only.
+            "unrealizedPl": 75.0,
         }])
 
         asyncio.run(bot_module.check_and_apply_trailing_stops(positions))

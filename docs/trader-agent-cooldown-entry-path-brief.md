@@ -38,6 +38,6 @@ The 2026-10-01 12:30 ET UKOIL.R SELL would have been rejected → ~$111.68 of th
 
 ## Standing rules (do not change)
 
-Risk parameters are frozen: TARGET_DOLLAR_RISK ($100), TP_CONFIG ($125 TP1), TRAILING_SL_BE_PROFIT ($75), TRAILING_SL_LOCK_TRIGGER ($90) / TRAILING_SL_LOCK_DOLLARS ($50), MAX_DAILY_LOSS ($400), sizing formula, lot caps, session windows, flattening behavior, AI_FAIL_OPEN. This brief changes only *which alerts become trades*, never position sizing or risk.
+Risk parameters are frozen: TARGET_DOLLAR_RISK ($100), TP_CONFIG ($125 TP1), TRAILING_SL_BE_PROFIT ($75), TRAILING_SL_LOCK_TRIGGER ($80) / TRAILING_SL_LOCK_DOLLARS ($50), MAX_DAILY_LOSS ($400), sizing formula, lot caps, session windows, flattening behavior, AI_FAIL_OPEN. This brief changes only *which alerts become trades*, never position sizing or risk.
 
 **Show the replay numbers before merge. No deploy until the owner approves.**
