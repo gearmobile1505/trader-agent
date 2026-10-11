@@ -224,7 +224,7 @@ TOP_SYMBOLS = {
         "point_value": 100.0,
         "min_lot": 0.01,
         "max_spread": 2.0,
-        "sessions": ["NY_EARLY", "NY"],
+        "sessions": ["NY"],
         "description": "US 30 Cash (Dow Jones)",
         "currency": "USD",
         "tick_size": 0.01
