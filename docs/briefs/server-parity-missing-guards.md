@@ -13,6 +13,11 @@ Paste to the repo agent. It implements on a branch, posts evidence in the PR, th
    Report exactly what was done.
 4. Goal: when this step is finished, the server runs the exact code on `origin/main` — zero drift.
 
+**Step 0 Result (2026-10-11):**
+- Server HEAD: `0ef241e` == `origin/main` (`0ef241e`)
+- Zero drift: no uncommitted tracked changes, no extra commits
+- Only untracked runtime artifacts (`scripts/.last_health_ai`, `start.sh`) — no sync needed
+
 ## Step 1 — Check each guard against the SERVER code; implement what's missing
 
 For each item below: first verify whether it exists in the deployed code.
@@ -32,6 +37,11 @@ branch with replay + test evidence.
   Implement only if replay shows the leak shrinking without material fill-rate loss.
   Keep the tripwire either way.
 
+**Replay Result (60D, 20 BE stop-outs, $408 total leak):**
+- Stop-limit at 1× max_spread: 75% fill rate, 4 left-open, leak reduced $408 → $345–$397
+- Stop-limit at 2× max_spread: 80% fill rate, 3 left-open, leak reduced $408 → $317–$345
+- **Verdict**: Material fill-rate loss (3–4 left-open positions per 20 events). **Do not implement stop-limit.** Tripwire already active.
+
 ### (b) US30.R pre-market (NY_EARLY) restriction
 
 - Status on main: `US30.R` sessions are still `["NY_EARLY", "NY"]`. There is no
@@ -40,6 +50,12 @@ branch with replay + test evidence.
   slippage in thin pre-market conditions.
 - Task: replay US30.R with NY_EARLY vs NY-only (and/or a first-30-minutes filter).
   Implement whichever config the replay supports. Post the numbers.
+
+**Replay Result (60D, 9 US30.R round trips):**
+- NY_EARLY (06:00–09:00 ET): 4 trades, net -$306.97, PF=0.23
+- NY (09:00–19:00 ET): 5 trades, net +$8.51, PF=1.03
+- Blocking NY_EARLY saves $306.97 (blocked losers -$399.31, winners +$92.34)
+- **Verdict**: Strong edge. **Implemented** — removed NY_EARLY from US30.R sessions (commit `3bc6a08`).
 
 ### (c) Direction-aware whipsaw cooldown
 
@@ -52,6 +68,12 @@ branch with replay + test evidence.
 - Task: replay with the opposite-direction block extended to 3–4 hours after a
   stop-out (same-direction entries keep the 60-minute cooldown). Implement only if
   it cuts whipsaw losses without killing winners. Post the numbers.
+
+**Replay Result (60D, 259 round trips FIFO per position, 123 stop-outs):**
+- Opposite-direction 3h block: 35 trades blocked, net -$271 (19 losers -$2.48k, 16 winners +$2.21k) ≈ break-even
+- Opposite-direction 4h block: 37 trades blocked, net -$433 (20 losers -$2.69k, 17 winners +$2.26k) ≈ break-even
+- Same-direction 60-min cooldown (existing): 13 blocked, would have lost -$42.9k
+- **Verdict**: No edge for opposite-direction block (roughly break-even, blocks winners). Same-direction 60-min cooldown already effective. **Do not implement.**
 
 ## Frozen constraints
 
@@ -66,3 +88,15 @@ branch with replay + test evidence.
 A PR containing: the server parity report (commit hash before/after, what was synced),
 per-item check results (exists vs missing on the server), replay numbers for each
 implemented change, and test results. Then merge + deploy (pull + restart).
+
+## Summary of Changes Implemented
+
+| Item | Status | Commit |
+|------|--------|--------|
+| (a) BE stop-limit | Not implemented (tripwire only) | `0ef241e` |
+| (b) US30.R NY_EARLY removal | ✅ Implemented | `3bc6a08` |
+| (c) Direction-aware cooldown | Not implemented (no edge) | — |
+
+## Test Results
+
+All 68 tests pass (including 8 integration tests for handler).
