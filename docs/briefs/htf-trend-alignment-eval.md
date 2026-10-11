@@ -35,10 +35,18 @@ Whichever is chosen, document the exact rule in the PR.
 ## Required reporting
 
 1. Per variant: trades blocked, trades taken, net P&L vs baseline, win-rate
-   delta, expectancy delta, per-symbol breakdown.
-2. Specifically report whether the 2026-10-07 EURUSD.R (+$493.00) and EURJPY.R
-   (+$369.24) winners survive each variant — those two trades carried that week,
-   and the filter must not silently eat the strategy's fat tails.
+   delta, expectancy delta, per-symbol breakdown. **Baseline is the 38-trade
+   bot-only history** (see correction below) — not the 40-trade mixed history.
+2. CORRECTION (owner 2026-10-11): the 2026-10-07 EURUSD.R (+$493.00) and EURJPY.R
+   (+$369.24) trades were the owner's MANUAL trades using his 4H price-action
+   BOS-retracement strategy — not bot trades. EXCLUDE them from the bot baseline
+   (true bot week 10/5→10/9: 38 trades, net -$600.16). Instead, use the owner's
+   manual approach as the reference concept: report whether each variant would
+   have TAKEN setups like those two manual trades (4H break-of-structure +
+   retracement entries, EURUSD/EURJPY entered 10/6 afternoon ET, held overnight)
+   — i.e., does the filter select for the same kind of trade the owner's manual
+   strategy takes? The filter must not silently exclude the strategy's best
+   manual-style opportunities.
 3. HTF data availability: state the fail-open vs fail-closed choice for when
    1H/4H candles can't be fetched at signal time, and measure how often that
    path triggers across the replay window.
