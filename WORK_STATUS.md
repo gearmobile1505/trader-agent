@@ -13,9 +13,9 @@ no live trading logic changes.
 
 ### Data Sources (all available on the live server at 138.197.8.50)
 - **alerts_log.jsonl** at `/opt/trader-agent/scripts/alerts_log.jsonl` — 454 lines,
-  88 successful bot trades, date range 2026-09-29 to 2026-10-13
+  91 successful bot trades, date range 2026-09-29 to 2026-10-13
 - **TradeLocker order history** via `tl.get_all_orders(lookback_period="90D", history=True)` —
-  548 filled orders, 275 positions
+  553 filled orders
 - **TradeLocker 4H price history** via `tl.get_price_history(instrument_id, resolution="4H", ...)`
 - **TradeLocker 1H price history** for USDJPY rate conversion
 
@@ -35,58 +35,52 @@ set -a && source /tmp/decrypted_env && set +a
 /opt/trader-agent/venv/bin/python3 scripts/replay_htf_eval.py 2>&1
 ```
 
-### Key Findings So Far
+## RESULTS (Generated 2026-10-14)
 
-#### Alert-to-Order Matching (DEBUGGED, WORKING)
-- 88 successful bot trades in alerts_log.jsonl
-- All 88 have broker_response order_ids (16-digit numbers like 216172782135535984)
-- All 88 order_ids ARE in the TradeLocker order history (verified)
-- BUT: `match_trade_to_position()` returns 0 matches — the bug is in the position
-  reconstruction logic, NOT the order_id lookup
+### Baseline (all bot trades)
+- 88 trades, 41 wins, 46 losses
+- Net P&L: $-1,143.14
+- Win rate: 46.6%
+- Expectancy: $-12.99
 
-#### TradeLocker Order Structure
-- Each position has 2 filled orders: entry (market) + exit (market/stop/limit)
-- Some positions have isOpen=True (still open, skip)
-- Some positions have 3+ filled orders (trailing stop cases)
-- Entry order: first by fill time (lastModified)
-- Exit order: last by fill time (lastModified)
-- Price data: use `avgPrice` column for actual fill price
+### Variant A (direction gate)
+- 55 trades taken, 33 blocked
+- Net P&L: $-1,050.47 (delta: +$92.67 vs baseline)
+- Win rate: 43.6% (delta: -3.0pp)
+- Expectancy: $-19.10 (delta: -$6.11)
 
-#### P&L Calculation
-- Non-JPY pairs: `(exit_price - entry_price) * direction * point_value * qty`
-- JPY pairs (GBPJPY, USDJPY): need USDJPY rate conversion
-- EUR pairs (LVMH, SIEMENS): multiply by EUR_USD_RATE (1.08)
+### Variant B (retracement + continuation)
+- 49 trades taken, 39 blocked
+- Net P&L: $-860.98 (delta: +$282.16 vs baseline)
+- Win rate: 44.9% (delta: -1.7pp)
+- Expectancy: $-17.57 (delta: -$4.58)
 
-#### HTF Trend Computation (IMPLEMENTED, NOT YET TESTED)
-- Fetch 4H bars per symbol covering the full replay window
-- Compute swing-structure trend at each entry time:
-  - Compare first half vs second half of 20-bar lookback
-  - Higher highs + higher lows = uptrend
-  - Lower highs + lower lows = downtrend
-  - Otherwise = no_clear_trend
-- Also compute EMA21 and EMA50 for Variant B
-- **Variant A**: reject if trade direction opposes 4H trend; allow on no_clear_trend
-- **Variant B**: Variant A + require entry within 2% of 4H EMA21
+### Manual Trade Survival Check
+Both owner's manual trades would PASS both variants:
+- EURUSD.R (+$493.00, SELL): 4H downtrend → PASS Variant A and B
+- EURJPY.R (+$369.24, SELL): 4H downtrend → PASS Variant A and B
 
-#### Filter Variants to Evaluate
-- **Variant A** (direction gate): reject entries that oppose 4H trend
-- **Variant B** (retracement + continuation): Variant A + entry near 4H EMA21
+### HTF Data Availability
+- 0% failure rate (all 88 trades had sufficient 4H bars)
+- Choice: FAIL-OPEN (when 4H candles can't be fetched, the trade is allowed)
 
-#### Required Reporting
-1. Per variant: trades blocked, trades taken, net P&L vs baseline, win-rate delta,
-   expectancy delta, per-symbol breakdown
-2. Whether owner's manual EURUSD.R (+$493) and EURJPY.R (+$369) trades survive
-3. HTF data availability: fail-open vs fail-closed choice, failure rate
-4. Trade frequency impact: expected entries per week
+### Trade Frequency Impact
+- Baseline: 41.1 trades/week
+- Variant A: 25.7 trades/week
+- Variant B: 22.9 trades/week
 
-### Current State
-- `scripts/replay_htf_eval.py` is written and on the server
-- It correctly loads 88 bot trades and matches all 88 order_ids
-- But `match_trade_to_position()` returns 0 — needs debugging of position reconstruction
-- The HTF trend computation logic is implemented but not yet tested end-to-end
-- No results have been generated yet
+### Per-Symbol Breakdown (Variant B)
+| Symbol | Trades | Net P&L | Win Rate |
+|---|---|---|---|
+| GBPJPY.R | 8 | $61.33 | 50.0% |
+| NAS100.R | 3 | $-99.74 | 33.3% |
+| UKOIL.R | 5 | $-311.71 | 40.0% |
+| US30.R | 3 | $-173.44 | 33.3% |
+| USDJPY.R | 7 | $-99.64 | 28.6% |
+| XAUUSD.R | 20 | $-120.97 | 55.0% |
+| XPDUSD.R | 3 | $-116.81 | 33.3% |
 
-### What Needs to Be Done
-1. Fix `match_trade_to_position()` to correctly reconstruct positions from TradeLocker orders
-2. Run the replay to generate numbers for both variants
-3. Post the results as a PR comment on PR #10
+## What Needs to Be Done
+1. **Post the replay numbers as a PR comment** on PR #10
+2. The script is working — results are in `/tmp/htf_replay_results.csv` and `/tmp/htf_replay_summary.json`
+3. No further code changes needed unless the numbers need adjustment

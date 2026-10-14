@@ -249,18 +249,20 @@ def _finite_or_zero(v) -> float:
 
 def match_trade_to_position(trade: dict, orders: pd.DataFrame,
                             instruments: pd.DataFrame | None = None,
-                            tl=None) -> dict | None:
+                            tl=None, failures: Counter | None = None) -> dict | None:
     """Find the TradeLocker position for a bot trade and determine exit + P&L."""
+    if failures is None:
+        failures = match_failures
     order_id = str(trade["order_id"])
 
     hit = orders[orders["_order_id"] == order_id]
     if hit.empty:
-        match_failures["order_id_not_in_history"] += 1
+        failures["order_id_not_in_history"] += 1
         return None
 
     position_id = hit["positionId"].iloc[0]
     if pd.isna(position_id):
-        match_failures["no_position_id"] += 1
+        failures["no_position_id"] += 1
         return None
 
     pos_orders = orders[orders["positionId"] == position_id].sort_values("_fill_time")
@@ -269,7 +271,7 @@ def match_trade_to_position(trade: dict, orders: pd.DataFrame,
 
     # A position is closed iff a closing order has filled.
     if closing.empty:
-        match_failures["position_still_open"] += 1
+        failures["position_still_open"] += 1
         return None
 
     entry_row = opening.iloc[0] if not opening.empty else pos_orders.iloc[0]
@@ -283,13 +285,13 @@ def match_trade_to_position(trade: dict, orders: pd.DataFrame,
     direction_str = side if side in ("buy", "sell") else trade["direction"]
     direction = 1.0 if direction_str == "buy" else -1.0
     if direction_str != trade["direction"]:
-        match_failures["direction_mismatch_alert_vs_fill"] += 1
+        failures["direction_mismatch_alert_vs_fill"] += 1
 
     entry_price = _first_valid_price(entry_row["_avg_price"], entry_row["_price"])
     exit_price = _first_valid_price(exit_row["_avg_price"], exit_row["_price"])
     qty = trade["qty"]
     if entry_price <= 0 or exit_price <= 0 or qty <= 0:
-        match_failures["bad_price_or_qty"] += 1
+        failures["bad_price_or_qty"] += 1
         return None
 
     if cfg["currency"] == "JPY":
@@ -297,7 +299,7 @@ def match_trade_to_position(trade: dict, orders: pd.DataFrame,
         usd_jpy_rate = _get_usd_jpy_rate(tl, entry_row["_entry_time"])
         if usd_jpy_rate <= 0:
             usd_jpy_rate = 150.0  # fallback
-            match_failures["usdjpy_rate_fallback_used"] += 1
+            failures["usdjpy_rate_fallback_used"] += 1
         pnl = (exit_price - entry_price) * direction * JPY_CONTRACT_SIZE * qty / usd_jpy_rate
     elif cfg["currency"] == "EUR":
         pnl = (exit_price - entry_price) * direction * cfg["point_value"] * qty * EUR_USD_RATE
@@ -703,8 +705,9 @@ def main():
 
     completed_trades = []
     unmatched = 0
+    match_failures = Counter()
     for trade in bot_trades:
-        matched = match_trade_to_position(trade, orders, instruments, tl=tl)
+        matched = match_trade_to_position(trade, orders, instruments, tl=tl, failures=match_failures)
         if matched:
             completed_trades.append(matched)
         else:
