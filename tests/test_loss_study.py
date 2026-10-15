@@ -378,3 +378,85 @@ def test_owner_manual_trade_exclusion():
     assert _is_owner_manual_trade(trade) is True
     trade["symbol"] = "XAUUSD.R"
     assert _is_owner_manual_trade(trade) is False
+
+
+# ---------------------------------------------------------------------------
+# PR #11 follow-up: per-symbol windows, 1015 backoff, 1H resolution
+# ---------------------------------------------------------------------------
+from scripts.stop_tightening_eval import (
+    BAR_SECONDS_BY_RESOLUTION,
+    PRICE_HISTORY_RESOLUTIONS,
+    RATE_LIMIT_BACKOFF_SECONDS,
+    RATE_LIMIT_MAX_RETRIES,
+    _fetch_symbol_window,
+)
+
+
+def test_resolution_chain_includes_1h():
+    assert "1H" in PRICE_HISTORY_RESOLUTIONS
+    assert PRICE_HISTORY_RESOLUTIONS == ("1m", "5m", "15m", "1H")
+    assert BAR_SECONDS_BY_RESOLUTION["1H"] == 3600
+
+
+def test_rate_limit_backoff_constants():
+    assert RATE_LIMIT_BACKOFF_SECONDS == 60.0
+    assert RATE_LIMIT_MAX_RETRIES == 3
+
+
+def test_fetch_symbol_window_uses_cache_and_skips_empty(monkeypatch, tmp_path):
+    monkeypatch.setattr("scripts.stop_tightening_eval.time.sleep", lambda *_: None)
+    monkeypatch.setattr("scripts.stop_tightening_eval.HISTORY_REQUEST_MIN_INTERVAL_SECONDS", 0.0)
+    calls = []
+
+    class FakeTL:
+        def get_price_history(self, **kwargs):
+            calls.append(kwargs)
+            return None  # empty -> should keep trying resolutions
+
+    start = pd.Timestamp("2026-10-01T10:00:00Z")
+    end = start + pd.Timedelta(hours=2)
+    with pytest.raises(RuntimeError):
+        _fetch_symbol_window(FakeTL(), 13119, "UKOIL.R", start, end, tmp_path)
+    # 4 resolutions x (1 initial + 3 retries) = 16 attempts
+    assert len(calls) == 4 * (1 + RATE_LIMIT_MAX_RETRIES)
+
+
+def test_fetch_symbol_window_returns_cached_without_calling(monkeypatch, tmp_path):
+    import pickle
+    cache_dir = tmp_path
+    bars = pd.DataFrame({"time": [1], "high": [2], "low": [1], "close": [1.5]})
+    (cache_dir / "UKOIL.R_13119_20261001T100000Z_20261001T120000Z.pkl").write_bytes(
+        pickle.dumps(bars)
+    )
+    called = []
+
+    class FakeTL:
+        def get_price_history(self, **kwargs):
+            called.append(kwargs)
+            return None
+
+    start = pd.Timestamp("2026-10-01T10:00:00Z")
+    end = start + pd.Timedelta(hours=2)
+    df, res = _fetch_symbol_window(FakeTL(), 13119, "UKOIL.R", start, end, cache_dir)
+    assert called == []
+    assert res == "cached"
+    assert len(df) == 1
+
+
+def test_fetch_symbol_window_retries_on_1015(monkeypatch, tmp_path):
+    attempts = {"n": 0}
+
+    class FakeTL:
+        def get_price_history(self, **kwargs):
+            attempts["n"] += 1
+            if attempts["n"] < 3:
+                raise RuntimeError("Cloudflare error 1015: You are being rate limited")
+            return pd.DataFrame({"t": [1], "h": [2], "l": [1], "c": [1.5]})
+
+    monkeypatch.setattr("scripts.stop_tightening_eval.time.sleep", lambda *_: None)
+    start = pd.Timestamp("2026-10-01T10:00:00Z")
+    end = start + pd.Timedelta(hours=2)
+    df, res = _fetch_symbol_window(FakeTL(), 13119, "UKOIL.R", start, end, tmp_path)
+    assert attempts["n"] == 3
+    assert res == "1m"
+    assert len(df) == 1
