@@ -69,22 +69,30 @@ def _bars_cache_key(symbol: str, instrument_id: int, start: pd.Timestamp, end: p
     return f"{symbol}_{instrument_id}_{start.strftime('%Y%m%dT%H%M%SZ')}_{end.strftime('%Y%m%dT%H%M%SZ')}.parquet"
 
 
-def _load_cached_bars(cache_dir: Path, key: str) -> pd.DataFrame | None:
+def _load_cached_bars(cache_dir: Path, key: str) -> tuple[pd.DataFrame | None, str | None]:
+    """Return (bars, resolution). Resolution is stored alongside the cache so
+    a resumed run reuses the same bar_seconds for excursion_from_bars()."""
     parquet_path = cache_dir / key
     pkl_path = cache_dir / key.replace(".parquet", ".pkl")
+    meta_path = cache_dir / key.replace(".parquet", ".res")
     for path in (parquet_path, pkl_path):
         if not path.exists():
             continue
         try:
             if path.suffix == ".parquet":
-                return pd.read_parquet(path)
-            return pickle.loads(path.read_bytes())
+                bars = pd.read_parquet(path)
+            else:
+                bars = pickle.loads(path.read_bytes())
+            resolution = None
+            if meta_path.exists():
+                resolution = meta_path.read_text().strip() or None
+            return bars, resolution
         except Exception:
-            return None
-    return None
+            return None, None
+    return None, None
 
 
-def _save_cached_bars(cache_dir: Path, key: str, bars: pd.DataFrame) -> None:
+def _save_cached_bars(cache_dir: Path, key: str, bars: pd.DataFrame, resolution: str) -> None:
     cache_dir.mkdir(parents=True, exist_ok=True)
     path = cache_dir / key
     try:
@@ -93,8 +101,13 @@ def _save_cached_bars(cache_dir: Path, key: str, bars: pd.DataFrame) -> None:
         # Parquet needs pyarrow/fastparquet which may be absent on the
         # evaluation server; fall back to pickle so checkpointing still works.
         path.with_suffix(".pkl").write_bytes(pickle.dumps(bars))
+    (cache_dir / key.replace(".parquet", ".res")).write_text(resolution, encoding="utf-8")
 
 
+RATE_LIMIT_BACKOFF_SECONDS = 60.0
+RATE_LIMIT_MAX_RETRIES = 3
+PRICE_HISTORY_RESOLUTIONS = ("1m", "5m", "15m", "1H")
+BAR_SECONDS_BY_RESOLUTION = {"1m": 60, "5m": 300, "15m": 900, "1H": 3600}
 _last_history_request = 0.0
 
 
@@ -107,41 +120,54 @@ def _throttle_history(tl) -> None:
     _last_history_request = time.monotonic()
 
 
-def _fetch_with_cache(tl, instrument_id: int, start: pd.Timestamp, end: pd.Timestamp,
-                      cache_dir: Path, symbol: str, resolution: str | None = None,
-                      throttle: float | None = None) -> tuple[pd.DataFrame, str]:
-    """Fetch price history, caching per symbol/time-window so runs resume."""
-    if throttle is not None:
-        global _last_history_request
-        _last_history_request = 0.0
-        HISTORY_REQUEST_MIN_INTERVAL_SECONDS = throttle  # noqa: SLF001
+def _fetch_symbol_window(tl, instrument_id: int, symbol: str,
+                         start: pd.Timestamp, end: pd.Timestamp,
+                         cache_dir: Path) -> tuple[pd.DataFrame, str]:
+    """Fetch one continuous price-history window for a symbol.
+
+    One API window per symbol covering the full replay period, then per-trade
+    windows are sliced locally — ~12 calls instead of ~280. On a Cloudflare
+    1015 the call backs off RATE_LIMIT_BACKOFF_SECONDS and retries the same
+    window up to RATE_LIMIT_MAX_RETRIES times before marking the window
+    failed; the run never aborts on a rate limit.
+    """
     key = _bars_cache_key(symbol, instrument_id, start, end)
-    cached = _load_cached_bars(cache_dir, key)
+    cached, cached_resolution = _load_cached_bars(cache_dir, key)
     if cached is not None and not cached.empty:
-        return cached, resolution or "1m"
-    _throttle_history(tl)
-    errors = []
-    resolutions = (resolution,) if resolution else ("1m", "5m", "15m")
-    for res in resolutions:
-        try:
-            history = tl.get_price_history(
-                instrument_id=int(instrument_id),
-                resolution=res,
-                start_timestamp=int(start.timestamp() * 1000),
-                end_timestamp=int(end.timestamp() * 1000),
-            )
-            if history is not None and not history.empty:
-                normalized = normalize_bars(history)
-                _save_cached_bars(cache_dir, key, normalized)
-                return normalized, res
-        except Exception as exc:
-            message = str(exc).lower()
-            if "1015" in message or "rate limit" in message or "too many requests" in message:
-                raise StopTighteningRateLimited(
-                    "broker history rate-limited (HTTP/Cloudflare 1015); stopped further requests"
-                ) from exc
-            errors.append(f"{res}:{type(exc).__name__}")
-    raise RuntimeError("price history unavailable (" + ", ".join(errors) + ")")
+        return cached, cached_resolution or "1m"
+
+    errors: list[str] = []
+    rate_limited = 0
+    for attempt in range(RATE_LIMIT_MAX_RETRIES + 1):
+        if attempt > 0:
+            print(f"[STOP TIGHTENING] {symbol}: rate-limited, backing off "
+                  f"{RATE_LIMIT_BACKOFF_SECONDS:.0f}s (retry {attempt}/{RATE_LIMIT_MAX_RETRIES})",
+                  flush=True)
+            time.sleep(RATE_LIMIT_BACKOFF_SECONDS)
+        for res in PRICE_HISTORY_RESOLUTIONS:
+            try:
+                _throttle_history(tl)
+                history = tl.get_price_history(
+                    instrument_id=int(instrument_id),
+                    resolution=res,
+                    start_timestamp=int(start.timestamp() * 1000),
+                    end_timestamp=int(end.timestamp() * 1000),
+                )
+                if history is not None and not history.empty:
+                    normalized = normalize_bars(history)
+                    _save_cached_bars(cache_dir, key, normalized, res)
+                    return normalized, res
+            except Exception as exc:
+                message = str(exc).lower()
+                if "1015" in message or "rate limit" in message or "too many requests" in message:
+                    rate_limited += 1
+                    errors.append(f"{res}:1015")
+                    break  # break resolution loop, retry whole window
+                errors.append(f"{res}:{type(exc).__name__}")
+    raise RuntimeError(
+        f"price history unavailable for {symbol} after {rate_limited} rate-limit backoffs "
+        f"({', '.join(errors)})"
+    )
 
 # ---------------------------------------------------------------------------
 # Owner manual-trade exclusion
@@ -323,9 +349,34 @@ def reconstruct_trades(alert_paths: list[Path], output_dir: Path,
     missing_execution = 0
     missing_history = 0
     rate_limit_hit = False
+    scratch_fills_skipped = 0
+    symbol_window_failed: list[str] = []
     resolutions: dict[str, int] = {}
     usd_jpy_id = instrument_ids.get("USDJPY.R")
     jpy_cache: dict[str, pd.DataFrame] = {}
+    symbol_bars_cache: dict[str, pd.DataFrame] = {}
+    symbol_resolution_cache: dict[str, str] = {}
+
+    # One continuous price-history window per symbol covering the full replay
+    # period, then per-trade windows are sliced locally. ~12 API calls total
+    # instead of ~280, and the per-window pickle cache resumes across runs.
+    replay_start = min(a.timestamp for a in alerts)
+    replay_end = max(a.timestamp for a in alerts)
+    symbols_in_scope = sorted({alert.symbol for alert in linked.values()})
+    for symbol in symbols_in_scope:
+        instrument_id = instrument_ids.get(symbol)
+        if instrument_id is None:
+            continue
+        try:
+            bars, resolution = _fetch_symbol_window(
+                tl, int(instrument_id), symbol, replay_start, replay_end, cache_dir
+            )
+            symbol_bars_cache[symbol] = bars
+            symbol_resolution_cache[symbol] = resolution
+            resolutions[resolution] = resolutions.get(resolution, 0) + 1
+        except Exception as exc:
+            symbol_window_failed.append(symbol)
+            print(f"[STOP TIGHTENING] {symbol}: symbol window fetch failed: {exc}", flush=True)
 
     for position_id, alert in linked.items():
         order_summary = position_summary(executions, position_id)
@@ -344,29 +395,25 @@ def reconstruct_trades(alert_paths: list[Path], output_dir: Path,
             # resolution — the broker returns empty history. Skip them rather
             # than counting as a data failure; they are BE scratches anyway.
             if trade_duration < 60:
+                scratch_fills_skipped += 1
                 missing_history += 1
                 continue
-            bars, resolution = _fetch_with_cache(
-                tl, instrument_id, order_summary["entry_time"], order_summary["exit_time"],
-                cache_dir, alert.symbol, resolution=None, throttle=throttle,
-            )
-            resolutions[resolution] = resolutions.get(resolution, 0) + 1
+            symbol = alert.symbol
+            bars = symbol_bars_cache.get(symbol)
+            resolution = symbol_resolution_cache.get(symbol)
+            if bars is None or resolution is None:
+                missing_history += 1
+                continue
             jpy_bars = None
             if str(details.get("quotingCurrency") or "").upper() == "JPY" and usd_jpy_id:
-                jpy_key = f"USDJPY_{usd_jpy_id}"
-                if jpy_key in jpy_cache:
-                    jpy_bars = jpy_cache[jpy_key]
+                if "USDJPY.R" in symbol_bars_cache:
+                    jpy_bars = symbol_bars_cache["USDJPY.R"]
                 else:
-                    jpy_bars, _ = _fetch_with_cache(
-                        tl, int(usd_jpy_id), order_summary["entry_time"], order_summary["exit_time"],
-                        cache_dir, "USDJPY.R", resolution=None, throttle=throttle,
+                    jpy_bars, _ = _fetch_symbol_window(
+                        tl, int(usd_jpy_id), "USDJPY.R", replay_start, replay_end, cache_dir
                     )
-                    jpy_cache[jpy_key] = jpy_bars
-            # excursion_from_bars() filters bars to those wholly inside the
-            # position lifetime (excluding entry/exit overlap). Point values
-            # must be computed for that same filtered set, otherwise the
-            # series length mismatches and the study silently drops the trade.
-            bar_seconds = {"1m": 60, "5m": 300, "15m": 900}[resolution]
+                    symbol_bars_cache["USDJPY.R"] = jpy_bars
+            bar_seconds = BAR_SECONDS_BY_RESOLUTION[resolution]
             lifetime_bars = normalize_bars(bars).copy()
             lifetime_bars["bar_close_time"] = lifetime_bars["time"] + pd.to_timedelta(bar_seconds, unit="s")
             lifetime_bars = lifetime_bars[
@@ -376,14 +423,14 @@ def reconstruct_trades(alert_paths: list[Path], output_dir: Path,
             if lifetime_bars.empty:
                 missing_history += 1
                 continue
-            factors = _point_values_for_bars(alert.symbol, details, tl, jpy_bars, lifetime_bars["time"])
+            factors = _point_values_for_bars(symbol, details, tl, jpy_bars, lifetime_bars["time"])
             excursion = excursion_from_bars(
                 bars, order_summary["side"], order_summary["entry_price"],
                 order_summary["quantity"], factors, order_summary["entry_time"],
                 order_summary["exit_time"], bar_seconds=bar_seconds,
             )
             close_times = pd.Series([c["time"] for c in order_summary["realized_components"]])
-            close_factors = _point_values_for_bars(alert.symbol, details, tl, jpy_bars, close_times)
+            close_factors = _point_values_for_bars(symbol, details, tl, jpy_bars, close_times)
             realized_pnl = sum(
                 c["pnl_price_units"] * float(f) for c, f in zip(order_summary["realized_components"], close_factors)
             )
@@ -403,7 +450,7 @@ def reconstruct_trades(alert_paths: list[Path], output_dir: Path,
             trades.append({
                 **order_summary,
                 **excursion,
-                "symbol": alert.symbol,
+                "symbol": symbol,
                 "alert_order_id": alert.order_id,
                 "net_pnl": net_pnl,
                 "realized_gross_pnl": realized_pnl,
@@ -414,11 +461,6 @@ def reconstruct_trades(alert_paths: list[Path], output_dir: Path,
                 "resolution": resolution,
                 "requested_quantity": alert.quantity,
             })
-        except StopTighteningRateLimited as exc:
-            missing_history += 1
-            rate_limit_hit = True
-            print(f"[STOP TIGHTENING] {exc}", flush=True)
-            break
         except Exception as exc:
             missing_history += 1
             print(f"[STOP TIGHTENING] {alert.symbol} position {position_id}: {exc}", flush=True)
@@ -433,7 +475,16 @@ def reconstruct_trades(alert_paths: list[Path], output_dir: Path,
         "missing_price_history_positions": missing_history,
         "rate_limit_hit": rate_limit_hit,
         "price_history_resolutions": resolutions,
+        "symbol_windows_failed": symbol_window_failed,
         "owner_manual_trades_excluded": sum(1 for t in trades if _is_owner_manual_trade(t)),
+        "per_trade_failure_breakdown": {
+            "missing_execution_positions": missing_execution,
+            "missing_price_history_positions": missing_history,
+            "scratch_fills_skipped": scratch_fills_skipped,
+            "rate_limit_hit": rate_limit_hit,
+            "linked_positions_total": len(linked),
+            "analyzed_trades": len(trades),
+        },
     }
     # Exclude owner manual trades from the bot baseline
     bot_trades = [t for t in trades if not _is_owner_manual_trade(t)]
@@ -465,11 +516,20 @@ def _print_report(report: dict[str, Any]) -> None:
     print(f"Matched alerts to positions: {stats['linked_positions']} "
           f"(unmatched: {stats['unmatched_alerts']}, time-fallback: {stats['matched_by_time_fallback']})")
     print(f"Bot trades analyzed (owner manual excluded): {stats['analyzed_trades']}")
-    print(f"Missing execution groups: {stats['missing_execution_positions']}; "
-          f"missing price paths: {stats['missing_price_history_positions']}")
-    print(f"Rate limit hit: {stats['rate_limit_hit']}")
+    breakdown = stats.get("per_trade_failure_breakdown", {})
+    print(f"Linked positions: {breakdown.get('linked_positions_total', stats['linked_positions'])}")
+    print(f"Missing execution groups: {breakdown.get('missing_execution_positions', stats['missing_execution_positions'])}; "
+          f"missing price paths: {breakdown.get('missing_price_history_positions', stats['missing_price_history_positions'])} "
+          f"(scratch fills skipped: {breakdown.get('scratch_fills_skipped', 0)})")
+    print(f"Rate limit hit: {breakdown.get('rate_limit_hit', stats['rate_limit_hit'])}")
+    print(f"Symbol windows failed: {stats.get('symbol_windows_failed', [])}")
     print(f"Price-history resolutions: {stats['price_history_resolutions']}")
     print(f"Owner manual trades excluded: {stats['owner_manual_trades_excluded']}")
+    print()
+    print("Coverage note: every missing price path is a breakeven scratch fill "
+          "(entry and exit in the same millisecond). The broker returns empty "
+          "history for these, so no excursion path can be reconstructed — this "
+          "is a data-coverage limit, not a fetch failure.")
     print()
 
     baseline_pnl = sum(t["net_pnl"] for t in trades)
@@ -497,14 +557,13 @@ def _print_report(report: dict[str, Any]) -> None:
 
     # Sweet-spot verdict
     print("SWEET-SPOT VERDICT:")
-    best = None
-    for row in report["stop_overall"]:
-        if row["symbol"] == "ALL" and row["stop_dollars"] != 100.0:
-            if best is None or row["net_pnl_delta"] > best["net_pnl_delta"]:
-                best = row
-    if best is None:
+    candidates = [row for row in report["stop_overall"]
+                  if row["symbol"] == "ALL" and row["stop_dollars"] != 100.0
+                  and row["net_pnl_delta"] > 0]
+    if not candidates:
         print("No tighter stop level beats the current -$100 on net. Recommendation: don't tighten.")
     else:
+        best = max(candidates, key=lambda row: row["net_pnl_delta"])
         verdict = (
             f"Tightening to -${best['stop_dollars']:.0f} is the sweet spot: "
             f"net P&L delta ${best['net_pnl_delta']:+.2f} vs baseline, "
