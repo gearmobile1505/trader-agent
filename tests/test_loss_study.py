@@ -263,3 +263,118 @@ def test_history_fetch_stops_resolution_fallback_on_rate_limit():
         _fetch_history(broker, 10, start, end)
 
     assert broker.calls == 1
+
+
+# ---------------------------------------------------------------------------
+# Stop-tightening evaluation (PR #11)
+# ---------------------------------------------------------------------------
+from scripts.stop_tightening_eval import (
+    STOP_LEVELS,
+    _is_owner_manual_trade,
+    _walk_stop_level,
+    simulate_stop_levels,
+)
+
+
+def _path(points):
+    return [{"time": pd.Timestamp(t), "pnl": p} for t, p in points]
+
+
+def test_stop_level_constants_match_live_bot():
+    assert STOP_LEVELS == (50.0, 75.0, 100.0)
+
+
+def test_walk_stop_level_kills_winner_before_be_trigger():
+    entry = pd.Timestamp("2026-10-01T10:00:00Z")
+    path = _path([
+        (entry + pd.Timedelta(minutes=5), -30.0),
+        (entry + pd.Timedelta(minutes=10), -55.0),   # crosses -$50 before BE
+        (entry + pd.Timedelta(minutes=20), 100.0),
+    ])
+    result = _walk_stop_level(path, 50.0, 75.0, 80.0, 100.0)
+    assert result["stop_hit"] is True
+    assert result["stop_pnl"] == pytest.approx(-55.0)
+    assert result["be_reached_before_stop"] is False
+
+
+def test_walk_stop_level_shielded_by_breakeven_trigger():
+    entry = pd.Timestamp("2026-10-01T10:00:00Z")
+    path = _path([
+        (entry + pd.Timedelta(minutes=5), -40.0),
+        (entry + pd.Timedelta(minutes=10), 80.0),    # hits BE trigger first
+        (entry + pd.Timedelta(minutes=20), -60.0),   # would cross -$50 later
+        (entry + pd.Timedelta(minutes=30), 100.0),
+    ])
+    result = _walk_stop_level(path, 50.0, 75.0, 80.0, 100.0)
+    assert result["stop_hit"] is False
+    assert result["be_reached_before_stop"] is True
+
+
+def test_walk_stop_level_shielded_by_profit_lock_trigger():
+    entry = pd.Timestamp("2026-10-01T10:00:00Z")
+    path = _path([
+        (entry + pd.Timedelta(minutes=5), 85.0),     # profit-lock trigger
+        (entry + pd.Timedelta(minutes=20), -60.0),   # would cross -$50 later
+        (entry + pd.Timedelta(minutes=30), 100.0),
+    ])
+    result = _walk_stop_level(path, 50.0, 75.0, 80.0, 100.0)
+    assert result["stop_hit"] is False
+    assert result["profit_lock_reached_before_stop"] is True
+
+
+def test_simulate_stop_levels_reports_killed_winners_and_saved_losers():
+    entry = pd.Timestamp("2026-10-01T10:00:00Z")
+    winner = {
+        "symbol": "GE", "entry_time": entry,
+        "exit_time": entry + pd.Timedelta(minutes=60),
+        "net_pnl": 100.0, "quantity": 1.0, "entry_fees": 0.0,
+        "path": _path([
+            (entry + pd.Timedelta(minutes=5), -30.0),
+            (entry + pd.Timedelta(minutes=10), -55.0),
+            (entry + pd.Timedelta(minutes=60), 100.0),
+        ]),
+    }
+    loser = {
+        "symbol": "GE", "entry_time": entry,
+        "exit_time": entry + pd.Timedelta(minutes=60),
+        "net_pnl": -100.0, "quantity": 1.0, "entry_fees": 0.0,
+        "path": _path([
+            (entry + pd.Timedelta(minutes=5), -40.0),
+            (entry + pd.Timedelta(minutes=10), -55.0),
+            (entry + pd.Timedelta(minutes=60), -100.0),
+        ]),
+    }
+    overall, by_symbol = simulate_stop_levels([winner, loser])
+    row = next(r for r in overall if r["stop_dollars"] == 50.0 and r["symbol"] == "ALL")
+    assert row["winners_killed"] == 1
+    assert row["losers_saved"] == 1
+    assert row["killed_damage"] == pytest.approx(100.0 - (-55.0))
+    assert row["losses_saved_dollars"] == pytest.approx((-55.0) - (-100.0))
+
+
+def test_simulate_stop_levels_baseline_is_zero_delta():
+    entry = pd.Timestamp("2026-10-01T10:00:00Z")
+    trades = [{
+        "symbol": "GE", "entry_time": entry,
+        "exit_time": entry + pd.Timedelta(minutes=60),
+        "net_pnl": -100.0, "quantity": 1.0, "entry_fees": 0.0,
+        "path": _path([
+            (entry + pd.Timedelta(minutes=5), -40.0),
+            (entry + pd.Timedelta(minutes=60), -100.0),
+        ]),
+    }]
+    overall, _ = simulate_stop_levels(trades)
+    baseline = next(r for r in overall if r["stop_dollars"] == 100.0 and r["symbol"] == "ALL")
+    assert baseline["net_pnl_delta"] == 0.0
+    assert baseline["trades_stopped"] == 0
+
+
+def test_owner_manual_trade_exclusion():
+    trade = {
+        "symbol": "EURUSD.R",
+        "entry_time": pd.Timestamp("2026-10-07T09:00:00Z"),
+        "net_pnl": 493.0,
+    }
+    assert _is_owner_manual_trade(trade) is True
+    trade["symbol"] = "XAUUSD.R"
+    assert _is_owner_manual_trade(trade) is False
