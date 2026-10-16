@@ -312,6 +312,12 @@ MAX_SL_OVERSHOOT_PCT = 25         # Max % over target risk at SL (min lot basis)
 # Tightened from 100 on 2026-10-02 after US30.R planned $152.48 of min-lot risk against a $100
 # target and passed a "100%" guard. At 25 the cap is $125 at minimum lot; TARGET_DOLLAR_RISK
 # itself is unchanged.
+# Per-symbol max stop distance (points), applied in the SL resolution path after
+# suggested_sl/ATR(10)x3/fallback is resolved and BEFORE validate_sl_distance runs.
+# US30.R (min lot 0.01, point value 100 → $1/pt): 125 pts = $125 min-lot risk, exactly at the
+# $125 max acceptable risk. If resolved SL distance ≤ cap, leave untouched; if wider, clamp to
+# exactly cap points from entry. validate_sl_distance stays as the backstop.
+MAX_SL_DISTANCE_POINTS = {"US30.R": 125.0}
 
 # Entry Vetting Gates (all default ON)
 ENABLE_TREND_GATE = True                # Reject counter-trend vs tech summary
@@ -1292,6 +1298,36 @@ def validate_sl_distance(tl_symbol: str, action: str, entry: float, sl: float) -
         )
 
     return True, "OK"
+
+
+def apply_max_sl_distance_cap(
+    tl_symbol: str, action: str, entry_price: float, suggested_sl: float, tick_size: float
+) -> float:
+    """Clamp US30.R stop distance to MAX_SL_DISTANCE_POINTS (125 pts).
+
+    Applied after suggested_sl / ATR(10)x3 / fallback is resolved and before
+    validate_sl_distance runs. If resolved SL distance <= cap, returns the SL
+    untouched; if wider, clamps to exactly `cap` points from entry.
+    Other symbols return suggested_sl unchanged.
+    """
+    max_sl_dist = MAX_SL_DISTANCE_POINTS.get(tl_symbol)
+    if max_sl_dist is None:
+        return suggested_sl
+
+    actual_sl_dist = abs(entry_price - suggested_sl)
+    if actual_sl_dist <= max_sl_dist:
+        return suggested_sl
+
+    if action == "buy":
+        clamped_sl = entry_price - max_sl_dist
+    else:
+        clamped_sl = entry_price + max_sl_dist
+    clamped_sl = quantize_price(clamped_sl, tick_size)
+    print(
+        f"[SL CAP] {tl_symbol} {action}: SL dist {actual_sl_dist:.2f} > cap "
+        f"{max_sl_dist:.0f} pts, clamping to {max_sl_dist:.0f}", flush=True,
+    )
+    return clamped_sl
 
 
 def validate_spread(tl_symbol: str) -> tuple[bool, str]:
@@ -2631,10 +2667,17 @@ def _process_tradingview_alert(data: dict, task_id: str):
     if actual_sl_dist < min_sl_dist:
         print(f"[MIN SL] {tl_symbol}: SL dist {actual_sl_dist:.2f} < min {min_sl_dist:.2f}, expanding", flush=True)
         if action == "buy":
-            suggested_sl = live_price - min_sl_dist
-        else:
             suggested_sl = live_price + min_sl_dist
+        else:
+            suggested_sl = live_price - min_sl_dist
         suggested_sl = quantize_price(suggested_sl, tick_size)
+
+    # Per-symbol max stop distance cap (US30.R = 125 points). Applied after
+    # suggested_sl/ATR(10)x3/fallback is resolved and before validate_sl_distance.
+    # If resolved SL distance ≤ cap, leave untouched; if wider, clamp to exactly
+    # cap points from entry. validate_sl_distance remains the backstop.
+    suggested_sl = apply_max_sl_distance_cap(tl_symbol, action, live_price, suggested_sl, tick_size)
+
     
     # ===== ENTRY VETTING GATES (deterministic, before AI) =====
     
