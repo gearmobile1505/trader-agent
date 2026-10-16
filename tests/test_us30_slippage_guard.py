@@ -212,3 +212,103 @@ def test_cap_leaves_validate_sl_distance_backstop_intact(bot):
     valid, reason = module.validate_sl_distance("US30.R", "sell", 51100.0, 50947.52)
     assert not valid
     assert "min lot risk=$152.48" in reason
+
+
+# ---------------------------------------------------------------------------
+# Regression: PR #13 — MIN SL expansion puts stop on correct side
+# ---------------------------------------------------------------------------
+def _min_side_fixture(monkeypatch, tmp_path):
+    """Fresh module import with all gates passing and order capture."""
+    monkeypatch.setenv("AI_TIMEOUT_SECONDS", "15")
+    monkeypatch.setenv("AI_MAX_PREDICT", "96")
+    monkeypatch.setenv("AI_MAX_CONCURRENCY", "2")
+    monkeypatch.setenv("AI_QUEUE_TIMEOUT_SECONDS", "30")
+    tradelocker = importlib.import_module("tradelocker")
+
+    class StubBroker:
+        def __init__(self):
+            self.bid = 100.0
+            self.ask = 100.0
+            self.orders = pd.DataFrame()
+            self.created = []
+
+        def get_latest_bid_price(self, instrument_id):
+            return self.bid
+
+        def get_latest_asking_price(self, instrument_id):
+            return self.ask
+
+        def get_all_orders(self, **kwargs):
+            return self.orders
+
+        def create_order(self, **kwargs):
+            self.created.append(kwargs)
+            return {"id": "test-order"}
+
+    broker = StubBroker()
+    monkeypatch.setattr(tradelocker, "TLAPI", lambda **kwargs: broker)
+    sys.modules.pop("scripts.main_cfd_5m", None)
+    module = importlib.import_module("scripts.main_cfd_5m")
+    monkeypatch.setattr(module, "tl", broker)
+    monkeypatch.setattr(module, "STATE_FILE", str(tmp_path / "bot_state.json"))
+    monkeypatch.setattr(module, "ALERT_LOG", str(tmp_path / "alerts.jsonl"))
+    monkeypatch.setattr(module, "get_instrument_id", lambda symbol: {
+        name: index + 1 for index, name in enumerate(module.TOP_SYMBOLS)
+    }[symbol])
+    monkeypatch.setattr(module, "get_point_value", lambda symbol: 100.0)
+    monkeypatch.setattr(module, "get_live_price", lambda symbol: 51000.0)
+    monkeypatch.setattr(module, "calculate_atr_sl", lambda *args, **kwargs: 0.0)
+    monkeypatch.setattr(module, "get_technical_summary", lambda symbol: "Neutral")
+    monkeypatch.setattr(module, "is_session_active", lambda config: True)
+    monkeypatch.setattr(module, "is_weekend_et", lambda: False)
+    monkeypatch.setattr(module, "validate_alert_freshness", lambda *a, **k: (True, "OK"))
+    monkeypatch.setattr(module, "validate_trend_gate", lambda *a, **k: (True, "OK"))
+    monkeypatch.setattr(module, "compute_daily_pnl", lambda *a, **k: 0.0)
+    monkeypatch.setattr(module, "get_cached_positions", lambda: pd.DataFrame())
+    monkeypatch.setattr(module, "cooldown_blocks_entry", lambda *a, **k: (False, "OK"))
+    monkeypatch.setattr(module, "session_loss_cap_blocks_entry", lambda *a, **k: (False, "OK"))
+    monkeypatch.setattr(module, "validate_slippage_guard", lambda *a, **k: (True, "OK"))
+    monkeypatch.setattr(module, "validate_entry", lambda *a, **k: (True, "OK"))
+    monkeypatch.setattr(module, "validate_sl_distance", lambda *a, **k: (True, "OK"))
+    monkeypatch.setattr(module, "validate_spread", lambda symbol: (True, "OK"))
+    monkeypatch.setattr(module, "calculate_position_size", lambda *a, **k: 0.01)
+    monkeypatch.setattr(
+        module.ai_decider, "decide",
+        lambda prompt: {"decision": "ALLOW", "confidence": 1.0, "reason": "test",
+                        "latency_ms": 0, "source": "test"},
+    )
+    module._POSITIONS_CACHE["last_error"] = None
+    module._STOP_OUT_COOLDOWN.clear()
+    return module, broker
+
+
+def test_min_sl_expansion_buy_stop_below_entry(monkeypatch, tmp_path):
+    """Buy with tight SL: MIN SL expansion puts stop BELOW entry (long side)."""
+    module, broker = _min_side_fixture(monkeypatch, tmp_path)
+    # US30.R: entry 51000, raw SL 50999 → dist 1 < min 153 → expand to 153,
+    # then cap to 125 → stop at 50875 (below entry). Verify correct side.
+    alert = {
+        "ticker": "US30", "action": "buy", "trend": "Neutral",
+        "indicator_value": 51000.0, "suggested_sl": 50999.0,
+        "bar_time": "2026-10-16T02:00:00Z",
+    }
+    result = module._process_tradingview_alert(alert, "task-min-sl-buy")
+    assert result["status"] == "success", result
+    assert len(broker.created) == 1, broker.created
+    sl = broker.created[0]["stop_loss"]
+    assert sl < 51000.0, f"buy stop {sl} not below entry 51000"  # correct side
+
+
+def test_min_sl_expansion_sell_stop_above_entry(monkeypatch, tmp_path):
+    """Sell with tight SL: MIN SL expansion puts stop ABOVE entry (short side)."""
+    module, broker = _min_side_fixture(monkeypatch, tmp_path)
+    alert = {
+        "ticker": "US30", "action": "sell", "trend": "Neutral",
+        "indicator_value": 51000.0, "suggested_sl": 51001.0,
+        "bar_time": "2026-10-16T02:00:00Z",
+    }
+    result = module._process_tradingview_alert(alert, "task-min-sl-sell")
+    assert result["status"] == "success", result
+    assert len(broker.created) == 1, broker.created
+    sl = broker.created[0]["stop_loss"]
+    assert sl > 51000.0, f"sell stop {sl} not above entry 51000"  # correct side

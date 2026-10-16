@@ -2667,9 +2667,9 @@ def _process_tradingview_alert(data: dict, task_id: str):
     if actual_sl_dist < min_sl_dist:
         print(f"[MIN SL] {tl_symbol}: SL dist {actual_sl_dist:.2f} < min {min_sl_dist:.2f}, expanding", flush=True)
         if action == "buy":
-            suggested_sl = live_price + min_sl_dist
-        else:
             suggested_sl = live_price - min_sl_dist
+        else:
+            suggested_sl = live_price + min_sl_dist
         suggested_sl = quantize_price(suggested_sl, tick_size)
 
     # Per-symbol max stop distance cap (US30.R = 125 points). Applied after
