@@ -45,11 +45,9 @@ def bot(monkeypatch, tmp_path):
 
 def test_minimum_lot_risk_cap_rejects_us30_152_48(bot):
     module, _ = bot
-
+    # With per-symbol $200 allowance for US30.R, 152pt (risk $152) is accepted
     valid, reason = module.validate_sl_distance("US30.R", "sell", 51100.0, 50947.52)
-
-    assert not valid
-    assert "min lot risk=$152.48" in reason
+    assert valid, reason
     assert module.MAX_SL_OVERSHOOT_PCT == 25
 
 
@@ -158,31 +156,25 @@ def test_exit_slippage_tripwire_records_and_logs_stop_fill(bot, monkeypatch, cap
 # ---------------------------------------------------------------------------
 def test_us30_sl_cap_125_untouched(bot):
     module, _ = bot
-    # BUY at 51000, SL at 50875 → exactly 125 pts below entry, must be untouched
-    clamped = module.apply_max_sl_distance_cap("US30.R", "buy", 51000.0, 50875.0, 0.01)
-    assert clamped == 50875.0
-
-    # SELL at 51000, SL at 51125 → exactly 125 pts above entry, untouched
-    clamped = module.apply_max_sl_distance_cap("US30.R", "sell", 51000.0, 51125.0, 0.01)
-    assert clamped == 51125.0
+    # PR #14: cap is now 200 pts
+    clamped = module.apply_max_sl_distance_cap("US30.R", "buy", 51000.0, 50800.0, 0.01)
+    assert clamped == 50800.0
+    clamped = module.apply_max_sl_distance_cap("US30.R", "sell", 51000.0, 51200.0, 0.01)
+    assert clamped == 51200.0
 
 
 def test_us30_sl_cap_126_clamped_to_125(bot):
     module, _ = bot
-    # BUY at 51000, SL at 50874 → 126 pts, clamp to 125 → 50875
-    clamped = module.apply_max_sl_distance_cap("US30.R", "buy", 51000.0, 50874.0, 0.01)
-    assert clamped == pytest.approx(50875.0)
-
-    # SELL at 51000, SL at 51126 → 126 pts, clamp to 125 → 51125
-    clamped = module.apply_max_sl_distance_cap("US30.R", "sell", 51000.0, 51126.0, 0.01)
-    assert clamped == pytest.approx(51125.0)
+    # PR #14: cap is now 200 pts
+    clamped = module.apply_max_sl_distance_cap("US30.R", "buy", 51000.0, 50800.0, 0.01)
+    assert clamped == 50800.0
 
 
 def test_us30_sl_cap_wide_150_clamped(bot):
     module, _ = bot
-    # A previously-vetoed 150-pt US30 stop clamps to exactly 125
+    # Cap now 200; 150 pt stop is untouched
     clamped = module.apply_max_sl_distance_cap("US30.R", "buy", 51100.0, 50947.52, 0.01)
-    assert clamped == pytest.approx(50975.0)  # 51100 - 125
+    assert clamped == pytest.approx(50947.52)
 
 
 def test_cap_applies_us30_only(bot):
@@ -195,23 +187,21 @@ def test_cap_applies_us30_only(bot):
 
 def test_vetoed_150_pt_us30_passes_sl_distance_after_cap(bot):
     module, _ = bot
-    # 150-pt US30 stop was vetoed by validate_sl_distance; after the cap clamps
-    # it to 125 pts, validation passes with $125 max risk (== max acceptable).
-    entry, raw_sl = 51100.0, 50947.52
-    clamped = module.apply_max_sl_distance_cap("US30.R", "sell", entry, raw_sl, 0.01)
-    # raw distance 152.48 > 125 → clamped to entry + 125 = 51225
-    assert clamped == pytest.approx(51225.0)
-    valid, reason = module.validate_sl_distance("US30.R", "sell", entry, clamped)
+    # 150-pt US30 stop is now accepted (cap 200, allowance $200)
+    entry, raw_sl = 51100.0, 50950.0  # 150 pts
+    clamped = module.apply_max_sl_distance_cap("US30.R", "buy", entry, raw_sl, 0.01)
+    assert clamped == pytest.approx(50950.0)  # untouched (<=200)
+    valid, reason = module.validate_sl_distance("US30.R", "buy", entry, clamped)
     assert valid, reason
     assert module.MAX_SL_OVERSHOOT_PCT == 25
 
 
 def test_cap_leaves_validate_sl_distance_backstop_intact(bot):
     module, _ = bot
-    # validate_sl_distance still rejects a raw >$125 min-lot risk stop (no cap applied)
-    valid, reason = module.validate_sl_distance("US30.R", "sell", 51100.0, 50947.52)
-    assert not valid
-    assert "min lot risk=$152.48" in reason
+    # With cap 200, 250 pt stop is clamped to 200 and accepted; validate_sl_distance
+    # still uses the global guard for non-capped symbols.
+    valid, reason = module.validate_sl_distance("US30.R", "sell", 51100.0, 50900.0)
+    assert valid, reason
 
 
 # ---------------------------------------------------------------------------
@@ -312,3 +302,47 @@ def test_min_sl_expansion_sell_stop_above_entry(monkeypatch, tmp_path):
     assert len(broker.created) == 1, broker.created
     sl = broker.created[0]["stop_loss"]
     assert sl > 51000.0, f"sell stop {sl} not above entry 51000"  # correct side
+
+
+# ---------------------------------------------------------------------------
+# PR #14 — US30.R stop cap loosened to 200 pts
+# ---------------------------------------------------------------------------
+def test_us30_sl_cap_200_untouched(bot):
+    module, _ = bot
+    # At 200 pts, untouched
+    clamped = module.apply_max_sl_distance_cap("US30.R", "buy", 51000.0, 50800.0, 0.01)
+    assert clamped == 50800.0
+    clamped = module.apply_max_sl_distance_cap("US30.R", "sell", 51000.0, 51200.0, 0.01)
+    assert clamped == 51200.0
+
+
+def test_us30_sl_cap_201_clamped_to_200(bot):
+    module, _ = bot
+    clamped = module.apply_max_sl_distance_cap("US30.R", "buy", 51000.0, 50798.99, 0.01)
+    assert clamped == pytest.approx(50800.0)
+    clamped = module.apply_max_sl_distance_cap("US30.R", "sell", 51000.0, 51201.01, 0.01)
+    assert clamped == pytest.approx(51200.0)
+
+
+def test_us30_180pt_stop_accepted_with_new_cap(bot):
+    module, _ = bot
+    # 180 pt stop on US30.R should be accepted at $180 min-lot risk
+    valid, reason = module.validate_sl_distance("US30.R", "buy", 51000.0, 50820.0)
+    assert valid, reason
+
+
+def test_us30_250pt_clamped_to_200_and_accepted(bot):
+    module, _ = bot
+    # Raw 250 pt stop clamped to 200 by cap, then validate_sl_distance accepts at $200
+    entry, raw_sl = 51100.0, 50850.0  # 250 pts
+    clamped = module.apply_max_sl_distance_cap("US30.R", "sell", entry, raw_sl, 0.01)
+    assert clamped == pytest.approx(51300.0)  # entry + 200
+    valid, reason = module.validate_sl_distance("US30.R", "sell", entry, clamped)
+    assert valid, reason
+
+
+def test_non_us30_still_vetoed_at_125_equivalent(bot):
+    module, _ = bot
+    # Non-US30 symbols keep the global 25% guard
+    valid, reason = module.validate_sl_distance("XAUUSD.R", "buy", 2000.0, 1998.74)
+    assert not valid

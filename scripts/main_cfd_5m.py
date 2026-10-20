@@ -317,7 +317,7 @@ MAX_SL_OVERSHOOT_PCT = 25         # Max % over target risk at SL (min lot basis)
 # US30.R (min lot 0.01, point value 100 → $1/pt): 125 pts = $125 min-lot risk, exactly at the
 # $125 max acceptable risk. If resolved SL distance ≤ cap, leave untouched; if wider, clamp to
 # exactly cap points from entry. validate_sl_distance stays as the backstop.
-MAX_SL_DISTANCE_POINTS = {"US30.R": 125.0}
+MAX_SL_DISTANCE_POINTS = {"US30.R": 200.0}  # PR #14: loosened from 125→200 pts; allow $200 min-lot risk for US30.R only
 
 # Entry Vetting Gates (all default ON)
 ENABLE_TREND_GATE = True                # Reject counter-trend vs tech summary
@@ -1288,7 +1288,14 @@ def validate_sl_distance(tl_symbol: str, action: str, entry: float, sl: float) -
     min_lot = get_min_lot(tl_symbol)
     point_val = get_point_value(tl_symbol)
     min_lot_risk = sl_dist * min_lot * point_val
-    max_acceptable_risk = TARGET_DOLLAR_RISK * (1 + MAX_SL_OVERSHOOT_PCT / 100)
+    # Per-symbol allowance: symbols with a MAX_SL_DISTANCE_POINTS cap get their
+    # risk ceiling raised to cap_points * point_value * min_lot (US30.R 200 pts = $200).
+    # Global 25% guard still applies to other symbols.
+    max_sl_dist_cap = MAX_SL_DISTANCE_POINTS.get(tl_symbol)
+    if max_sl_dist_cap is not None:
+        max_acceptable_risk = max_sl_dist_cap * min_lot * point_val
+    else:
+        max_acceptable_risk = TARGET_DOLLAR_RISK * (1 + MAX_SL_OVERSHOOT_PCT / 100)
 
     if min_lot_risk > max_acceptable_risk:
         max_sl_dist = max_acceptable_risk / (min_lot * point_val)
