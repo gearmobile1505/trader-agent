@@ -468,6 +468,9 @@ def current_session_start_et(symbol_config: dict) -> datetime | None:
             elif current < end:
                 starts.append(start_dt - timedelta(days=1))
 
+    return max(starts) if starts else None
+
+
 def current_trading_day_start_et() -> datetime:
     """Start of the current trading day: Asia session open (20:00 ET).
 
@@ -483,6 +486,9 @@ def current_trading_day_start_et() -> datetime:
     if now_et < today_20:
         return today_20 - timedelta(days=1)
     return today_20
+
+
+def session_exit_info(symbol_config: dict) -> tuple[bool, float | None]:
     """
     Return (in_session, minutes_until_latest_session_end).
 

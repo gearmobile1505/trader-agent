@@ -13,7 +13,8 @@ from collections import defaultdict
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import main_cfd_5m as bot
 
-BE_SLIP_MIN_LOSS = 0.01  # a fill counts as BE-slip if realized loss > this
+BE_SLIP_MIN_LOSS = 0.01   # a fill counts as BE-slip if realized loss > this
+BE_SLIP_MAX_LOSS = 20.0   # a BE-slip is a small slippage loss, not a full stop-out
 
 
 def _safe_float(v):
@@ -93,8 +94,9 @@ def collect_be_slips(days=30):
         else:
             realized = (fill_price - entry_price) * qty * point_val
 
-        # BE-slip: stop was at entry but filled with loss
-        if realized > BE_SLIP_MIN_LOSS:
+        # BE-slip: stop was at entry but filled with a small loss (slippage).
+        # Full stop-outs (loss >= BE_SLIP_MAX_LOSS) are excluded.
+        if BE_SLIP_MIN_LOSS < realized < BE_SLIP_MAX_LOSS:
             slip_points = abs(fill_price - entry_price)
             slip_dollars = realized
             results.append({
