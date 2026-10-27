@@ -350,6 +350,15 @@ ENABLE_SESSION_LOSS_CAP = True
 SESSION_LOSS_CAP_LIMIT = 2               # stop-outs before the cap engages
 SESSION_LOSS_CAP_MIN_LOSS = 50.0         # $; losses below this never count
 
+# Same-symbol per-day loss cap (Issue #17, Part A). After 1 full-SL stop-out
+# on a symbol in a trading day, block further entries on that symbol until the
+# next trading day (Asia open 20:00 ET). BE scratches excluded; partial fills
+# and market closes do not trip it. Applies alongside the per-session cap;
+# whichever trips first wins.
+ENABLE_DAILY_LOSS_CAP = True
+DAILY_LOSS_CAP_LIMIT = 1                 # full stop-outs before the cap engages
+DAILY_LOSS_CAP_MIN_LOSS = 50.0           # $; losses below this never count
+
 # Session exit protection
 # A position is flattened this long before its trading session ends. Holding
 # into a close exposes the position to the illiquid gap afterwards, where the
@@ -459,10 +468,21 @@ def current_session_start_et(symbol_config: dict) -> datetime | None:
             elif current < end:
                 starts.append(start_dt - timedelta(days=1))
 
-    return max(starts) if starts else None
+def current_trading_day_start_et() -> datetime:
+    """Start of the current trading day: Asia session open (20:00 ET).
 
-
-def session_exit_info(symbol_config: dict) -> tuple[bool, float | None]:
+    A trading day runs from 20:00 ET (Asia open) through 19:00 ET the
+    following day (NY close). If the current time is before 20:00 ET, the
+    trading day started yesterday at 20:00 ET. Used by the per-day loss cap
+    so the count resets at the trading-day boundary.
+    """
+    import pytz
+    et = pytz.timezone('US/Eastern')
+    now_et = datetime.now(et)
+    today_20 = now_et.replace(hour=20, minute=0, second=0, microsecond=0)
+    if now_et < today_20:
+        return today_20 - timedelta(days=1)
+    return today_20
     """
     Return (in_session, minutes_until_latest_session_end).
 
@@ -947,6 +967,92 @@ def session_loss_cap_blocks_entry(tl_symbol: str) -> tuple[bool, str | None]:
             f"{count} full-SL stop-outs on {tl_symbol} in current session "
             f"(each >= ${SESSION_LOSS_CAP_MIN_LOSS:.0f}); "
             f"cap is {SESSION_LOSS_CAP_LIMIT} until session ends"
+        )
+    return False, None
+
+
+def daily_loss_cap_blocks_entry(tl_symbol: str) -> tuple[bool, str | None]:
+    """Reject a symbol after DAILY_LOSS_CAP_LIMIT full-SL stop-outs in the
+    current trading day (Issue #17, Part A). Mirrors session_loss_cap_blocks_entry
+    but the window is the full trading day (Asia open 20:00 ET through NY close
+    19:00 ET the following day), so the cap resets once per calendar trading day
+    rather than per session.
+
+    Derives the count from the same cached broker order history the session cap
+    uses, joined by positionId. A stop-exit counts only when its realized loss
+    is >= DAILY_LOSS_CAP_MIN_LOSS -- breakeven scratches never do. Partial
+    fills and market closes do not trip it.
+
+    Fails OPEN with a loud log when history can't be fetched.
+    """
+    if not ENABLE_DAILY_LOSS_CAP:
+        return False, None
+
+    day_start = current_trading_day_start_et()
+    day_start_ts = day_start.timestamp()
+
+    try:
+        orders = _cached_all_filled_orders()
+    except Exception as exc:
+        print(
+            f"[DAILY LOSS CAP] history check failed, failing open for {tl_symbol}: {exc}",
+            flush=True,
+        )
+        return False, None
+
+    if orders is None or len(orders) == 0:
+        return False, None
+
+    inst_id = get_instrument_id(tl_symbol)
+    subset = orders[pd.to_numeric(orders["tradableInstrumentId"], errors="coerce") == inst_id]
+    if subset.empty:
+        return False, None
+
+    entries: dict[str, dict] = {}
+    for _, row in subset.iterrows():
+        if str(row.get("type", "")).lower() not in ("market", "limit"):
+            continue
+        pid = normalize_id_static(row.get("positionId"))
+        if not pid or pid in entries:
+            continue
+        entries[pid] = {
+            "side": str(row.get("side", "")).lower(),
+            "price": _safe_float(row.get("avgPrice") or row.get("price")),
+            "qty": _safe_float(row.get("filledQty") or row.get("qty")),
+        }
+
+    count = 0
+    for _, row in subset.iterrows():
+        if str(row.get("type", "")).lower() not in COOLDOWN_STOP_EXIT_ORDER_TYPES:
+            continue
+        pid = normalize_id_static(row.get("positionId"))
+        entry = entries.get(pid)
+        exited_at = _order_exit_epoch(row)
+        if entry is None or exited_at is None or exited_at < day_start_ts:
+            continue
+        fill = _safe_float(row.get("avgPrice"))
+        if entry["price"] is None or entry["qty"] is None or fill is None:
+            continue
+        point_val = get_point_value(tl_symbol)
+        if TOP_SYMBOLS.get(tl_symbol, {}).get("currency") == "EUR":
+            point_val *= EUR_USD_RATE
+        if entry["side"] == "buy":
+            loss = (entry["price"] - fill) * entry["qty"] * point_val
+        else:
+            loss = (fill - entry["price"]) * entry["qty"] * point_val
+        if loss >= DAILY_LOSS_CAP_MIN_LOSS:
+            count += 1
+            print(
+                f"[DAILY LOSS CAP] {tl_symbol}: full stop-out #{count} (loss ${loss:.2f}) "
+                f"position {pid}",
+                flush=True,
+            )
+
+    if count >= DAILY_LOSS_CAP_LIMIT:
+        return True, (
+            f"{count} full-SL stop-outs on {tl_symbol} in current trading day "
+            f"(each >= ${DAILY_LOSS_CAP_MIN_LOSS:.0f}); "
+            f"cap is {DAILY_LOSS_CAP_LIMIT} until next trading day (20:00 ET)"
         )
     return False, None
 
@@ -2776,6 +2882,20 @@ def _process_tradingview_alert(data: dict, task_id: str):
                 "status": "rejected",
                 "reason": f"Session loss cap: {loss_cap_detail}",
                 "gate": "session_loss_cap"
+            }
+            log_alert(data, result)
+            print(f"[GATE] {tl_symbol}: {result['reason']}", flush=True)
+            return result
+
+        # Per-day loss cap (Issue #17, Part A): block re-entry after
+        # DAILY_LOSS_CAP_LIMIT full-SL stop-outs on this symbol in the current
+        # trading day. Applies alongside the per-session cap.
+        day_capped, day_cap_detail = daily_loss_cap_blocks_entry(tl_symbol)
+        if day_capped:
+            result = {
+                "status": "rejected",
+                "reason": f"Daily loss cap: {day_cap_detail}",
+                "gate": "daily_loss_cap"
             }
             log_alert(data, result)
             print(f"[GATE] {tl_symbol}: {result['reason']}", flush=True)
