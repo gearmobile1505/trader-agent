@@ -87,6 +87,10 @@ def simulate_exit(path_bars, entry_price, entry_side, sl_price, tp_price,
             locked = True
 
     # if path exhausted without exit, use last close (approximate)
+    if path_bars:
+        last_hi, last_lo = path_bars[-1]
+        last_close = (last_hi + last_lo) / 2.0
+        return last_close, "open", be_triggered, locked
     return None, "open", be_triggered, locked
 
 
