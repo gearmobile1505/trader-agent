@@ -19,6 +19,8 @@ def tp_for_date(dt):
     return 125.0 if dt < datetime(2026, 10, 4, tzinfo=timezone.utc) else 100.0
 
 def run():
+    import time
+    time.sleep(5)
     tl = ls._build_client()
     alerts, load_stats = ls.load_successful_alerts(ALERT_PATHS)
     print(f"Loaded {len(alerts)} alerts")
