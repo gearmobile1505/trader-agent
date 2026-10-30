@@ -31,9 +31,11 @@ def run():
             d = json.loads(line)
             a = d.get('alert', {})
             r = d.get('result', {})
-            oid = r.get('order_id') or a.get('order_id')
-            if oid and a.get('suggested_sl') is not None:
-                sl_lookup[str(oid)] = a['suggested_sl']
+            if (r.get('status') in ('filled','success','executed','placed')
+                    or 'position' in str(r).lower() or r.get('reason','').startswith('placed')):
+                if a.get('suggested_sl') is not None:
+                    key = (d.get('timestamp','')[:19], a.get('ticker'))
+                    sl_lookup[key] = a['suggested_sl']
         except Exception:
             pass
 
@@ -91,7 +93,8 @@ def run():
 
             entry_price = os_["entry_price"]
             entry_side = os_["side"]
-            sl_price = sl_lookup.get(str(alert.order_id))
+            key = (str(alert.timestamp)[:19], alert.symbol)
+            sl_price = sl_lookup.get(key)
             if sl_price is None:
                 # fallback: approximate from $100 risk
                 risk_pts = 100.0 / (os_["quantity"] * pv) if (os_["quantity"] * pv) else 10
