@@ -50,6 +50,7 @@ def run():
     instrument_ids = dict(zip(instruments["name"].astype(str), instruments["tradableInstrumentId"].astype(int)))
     linked, unmatched, matched_by_time = ls.map_alerts_to_positions(alerts, orders, instrument_ids)
     print(f"Linked {len(linked)} positions")
+    executions = tl.get_all_executions()
 
     trades_out = []
     missing = 0
@@ -58,7 +59,7 @@ def run():
         _t2.sleep(2)
         try:
             os_ = ls.position_summary(
-                tl.get_all_executions(), position_id
+                executions, position_id
             )
             if os_ is None:
                 missing += 1
@@ -97,29 +98,29 @@ def run():
 
             entry_price = os_["entry_price"]
             entry_side = os_["side"]
-            key = (str(alert.timestamp)[:19].replace('T',' '), alert.symbol)
-            sl_price = sl_lookup.get(key)
-            if sl_price is None:
-                # fallback: approximate from $100 risk
-                risk_pts = 100.0 / (os_["quantity"] * pv) if (os_["quantity"] * pv) else 10
-                if entry_side == "buy":
-                    sl_price = entry_price - risk_pts
-                else:
-                    sl_price = entry_price + risk_pts
-
             qty = os_["quantity"]
             pv = ls.usd_per_price_unit(alert.symbol)
             if alert.symbol.endswith('.R') and 'EUR' in alert.symbol:
                 pv *= 1.0
-            if alert.symbol.endswith(".R") and "EUR" in alert.symbol:
-                pass
+            key = (str(alert.timestamp)[:19].replace('T',' '), alert.symbol)
+            sl_price = sl_lookup.get(key)
+            if sl_price is None:
+                risk_pts = 100.0 / (qty * pv) if (qty * pv) else 10
+                if entry_side == "buy":
+                    sl_price = entry_price - risk_pts
+                else:
+                    sl_price = entry_price + risk_pts
 
             dt = os_["entry_time"]
             if hasattr(dt, "to_pydatetime"):
                 dt = dt.to_pydatetime()
             if dt.tzinfo is None:
                 dt = dt.replace(tzinfo=timezone.utc)
-            tp_price = tp_for_date(dt)
+            tp_dollars = tp_for_date(dt)
+            if entry_side == "buy":
+                tp_price = entry_price + tp_dollars / (qty * pv) if (qty * pv) else entry_price + 1
+            else:
+                tp_price = entry_price - tp_dollars / (qty * pv) if (qty * pv) else entry_price - 1
 
             bar_list = [(float(r["high"]), float(r["low"])) for _, r in in_life.iterrows()]
 
