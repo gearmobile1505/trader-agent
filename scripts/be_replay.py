@@ -35,7 +35,9 @@ def run():
 
     trades_out = []
     missing = 0
+    import time as _t2
     for position_id, alert in linked.items():
+        _t2.sleep(2)
         try:
             os_ = ls.position_summary(
                 tl.get_all_executions(), position_id
@@ -48,9 +50,20 @@ def run():
                 missing += 1
                 continue
             details = tl.get_instrument_details(int(inst_id))
-            bars, resolution = ls._fetch_history(
-                tl, inst_id, os_["entry_time"], os_["exit_time"]
-            )
+            import time as _t
+            for _attempt in range(5):
+                try:
+                    bars, resolution = ls._fetch_history(
+                        tl, inst_id, os_["entry_time"], os_["exit_time"]
+                    )
+                    break
+                except Exception as _e:
+                    if "429" in str(_e) or "Too Many" in str(_e):
+                        _t.sleep(10 * (_attempt + 1))
+                    else:
+                        raise
+            else:
+                raise RuntimeError("rate limited")
             normalized = ls.normalize_bars(bars)
             # filter bars inside position lifetime
             normalized["bar_close_time"] = normalized["time"] + pd.to_timedelta(
