@@ -24,6 +24,18 @@ def run():
     tl = ls._build_client()
     alerts, load_stats = ls.load_successful_alerts(ALERT_PATHS)
     print(f"Loaded {len(alerts)} alerts")
+    # Build sl lookup from raw alert log
+    sl_lookup = {}
+    for line in open(ALERT_PATHS[0]):
+        try:
+            d = json.loads(line)
+            a = d.get('alert', {})
+            r = d.get('result', {})
+            oid = r.get('order_id') or a.get('order_id')
+            if oid and a.get('suggested_sl') is not None:
+                sl_lookup[str(oid)] = a['suggested_sl']
+        except Exception:
+            pass
 
     start_ts = int(min(a.timestamp for a in alerts).timestamp() * 1000)
     end_ts = int(datetime.now(timezone.utc).timestamp() * 1000)
@@ -79,12 +91,9 @@ def run():
 
             entry_price = os_["entry_price"]
             entry_side = os_["side"]
-            sl_price = None  # derive from realized: use entry +/- risk; approximate
-            # Use the alert's SL if available
-            sl_price = getattr(alert, "sl_price", None)
+            sl_price = sl_lookup.get(str(alert.order_id))
             if sl_price is None:
-                # approximate: $100 risk
-                pv = ls.usd_per_price_unit(alert.symbol)
+                # fallback: approximate from $100 risk
                 risk_pts = 100.0 / (os_["quantity"] * pv) if (os_["quantity"] * pv) else 10
                 if entry_side == "buy":
                     sl_price = entry_price - risk_pts
@@ -93,6 +102,8 @@ def run():
 
             qty = os_["quantity"]
             pv = ls.usd_per_price_unit(alert.symbol)
+            if alert.symbol.endswith('.R') and 'EUR' in alert.symbol:
+                pv *= 1.0
             if alert.symbol.endswith(".R") and "EUR" in alert.symbol:
                 pass
 
