@@ -34,7 +34,11 @@ def run():
             if (r.get('status') in ('filled','success','executed','placed')
                     or 'position' in str(r).lower() or r.get('reason','').startswith('placed')):
                 if a.get('suggested_sl') is not None:
-                    key = (d.get('timestamp','')[:19], a.get('ticker'))
+                    ts = d.get('timestamp','')[:19].replace('T',' ')
+                    sym = a.get('ticker','')
+                    if not sym.endswith('.R') and sym in ('EURUSD','GBPUSD','USDCHF','AUDUSD','USDCAD','NZDUSD','EURJPY','EURGBP','AUDJPY','USDJPY','XAUUSD','XAGUSD','XPDUSD','US30','NAS100','SPX500','UKOIL'):
+                        sym = sym + '.R'
+                    key = (ts, sym)
                     sl_lookup[key] = a['suggested_sl']
         except Exception:
             pass
@@ -93,7 +97,7 @@ def run():
 
             entry_price = os_["entry_price"]
             entry_side = os_["side"]
-            key = (str(alert.timestamp)[:19], alert.symbol)
+            key = (str(alert.timestamp)[:19].replace('T',' '), alert.symbol)
             sl_price = sl_lookup.get(key)
             if sl_price is None:
                 # fallback: approximate from $100 risk
