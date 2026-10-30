@@ -1,8 +1,9 @@
 """BE-rule backtest replay (Issue #18): full run over Sep 24 - Oct 23.
 
 Reuses loss_study helpers for broker reconstruction, then runs 4 BE variants.
+Caches executions and bars to disk for resume support.
 """
-import os, sys, json, statistics
+import os, sys, json, time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -11,56 +12,87 @@ import loss_study as ls
 import be_rule_backtest as brb
 import pandas as pd
 
-ALERT_PATHS = [
-    Path("/opt/trader-agent/scripts/alerts_log.jsonl"),
-]
+ALERT_PATHS = [Path("/opt/trader-agent/scripts/alerts_log.jsonl")]
+CACHE_DIR = Path("/opt/trader-agent/be_replay_cache")
+CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
 
 def tp_for_date(dt):
     return 125.0 if dt < datetime(2026, 10, 4, tzinfo=timezone.utc) else 100.0
 
+
+def _load_cache(name):
+    p = CACHE_DIR / name
+    if p.exists():
+        return json.loads(p.read_text())
+    return None
+
+
+def _save_cache(name, data):
+    (CACHE_DIR / name).write_text(json.dumps(data, default=str))
+
+
 def run():
-    import time
-    time.sleep(5)
     tl = ls._build_client()
+    time.sleep(3)
     alerts, load_stats = ls.load_successful_alerts(ALERT_PATHS)
     print(f"Loaded {len(alerts)} alerts")
-    # Build sl lookup from raw alert log
+
+    start_ts = int(min(a.timestamp for a in alerts).timestamp() * 1000)
+    end_ts = int(datetime.now(timezone.utc).timestamp() * 1000)
+
+    # Cache orders
+    orders_cache = _load_cache("orders.json")
+    if orders_cache is None:
+        orders = tl.get_all_orders(start_timestamp=start_ts, end_timestamp=end_ts, history=True)
+        _save_cache("orders.json", orders.to_dict("records") if hasattr(orders, "to_dict") else [])
+        time.sleep(3)
+    else:
+        orders = pd.DataFrame(orders_cache)
+    print(f"Orders: {len(orders)}")
+
+    instruments = tl.get_all_instruments()
+    instrument_ids = dict(zip(instruments["name"].astype(str), instruments["tradableInstrumentId"].astype(int)))
+
+    linked, unmatched, matched_by_time = ls.map_alerts_to_positions(alerts, orders, instrument_ids)
+    print(f"Linked {len(linked)} positions")
+
+    # Cache executions (hoisted outside loop)
+    exec_cache = _load_cache("executions.json")
+    if exec_cache is None:
+        executions = tl.get_all_executions()
+        _save_cache("executions.json", executions.to_dict("records") if hasattr(executions, "to_dict") else [])
+        time.sleep(3)
+    else:
+        executions = pd.DataFrame(exec_cache)
+    print(f"Executions: {len(executions)}")
+
+    # sl lookup
     sl_lookup = {}
     for line in open(ALERT_PATHS[0]):
         try:
             d = json.loads(line)
             a = d.get('alert', {})
-            r = d.get('result', {})
-            if (r.get('status') in ('filled','success','executed','placed')
-                    or 'position' in str(r).lower() or r.get('reason','').startswith('placed')):
-                if a.get('suggested_sl') is not None:
-                    ts = d.get('timestamp','')[:19].replace('T',' ')
-                    sym = a.get('ticker','')
-                    if not sym.endswith('.R') and sym in ('EURUSD','GBPUSD','USDCHF','AUDUSD','USDCAD','NZDUSD','EURJPY','EURGBP','AUDJPY','USDJPY','XAUUSD','XAGUSD','XPDUSD','US30','NAS100','SPX500','UKOIL'):
-                        sym = sym + '.R'
-                    key = (ts, sym)
-                    sl_lookup[key] = a['suggested_sl']
+            if a.get('suggested_sl') is not None:
+                ts = d.get('timestamp', '')[:19].replace('T', ' ')
+                sym = a.get('ticker', '')
+                if not sym.endswith('.R'):
+                    sym = sym + '.R'
+                sl_lookup[(ts, sym)] = a['suggested_sl']
         except Exception:
             pass
 
-    start_ts = int(min(a.timestamp for a in alerts).timestamp() * 1000)
-    end_ts = int(datetime.now(timezone.utc).timestamp() * 1000)
-    orders = tl.get_all_orders(start_timestamp=start_ts, end_timestamp=end_ts, history=True)
-    instruments = tl.get_all_instruments()
-    instrument_ids = dict(zip(instruments["name"].astype(str), instruments["tradableInstrumentId"].astype(int)))
-    linked, unmatched, matched_by_time = ls.map_alerts_to_positions(alerts, orders, instrument_ids)
-    print(f"Linked {len(linked)} positions")
-    executions = tl.get_all_executions()
+    # Resume support
+    results_cache = _load_cache("results.json")
+    trades_out = results_cache if results_cache else []
+    done_keys = set((t.get("symbol"), t.get("entry_time")) for t in trades_out if t.get("variant") == "A")
+    print(f"Resuming: {len(done_keys)} trades already done")
 
-    trades_out = []
     missing = 0
-    import time as _t2
     for position_id, alert in linked.items():
-        _t2.sleep(2)
+        key = (alert.symbol, None)
         try:
-            os_ = ls.position_summary(
-                executions, position_id
-            )
+            os_ = ls.position_summary(executions, position_id)
             if os_ is None:
                 missing += 1
                 continue
@@ -68,25 +100,18 @@ def run():
             if inst_id is None:
                 missing += 1
                 continue
+
+            entry_time_str = str(os_["entry_time"])[:19]
+            if (alert.symbol, entry_time_str) in done_keys:
+                continue
+
             details = tl.get_instrument_details(int(inst_id))
-            import time as _t
-            for _attempt in range(5):
-                try:
-                    bars, resolution = ls._fetch_history(
-                        tl, inst_id, os_["entry_time"], os_["exit_time"]
-                    )
-                    break
-                except Exception as _e:
-                    if "429" in str(_e) or "Too Many" in str(_e):
-                        _t.sleep(10 * (_attempt + 1))
-                    else:
-                        raise
-            else:
-                raise RuntimeError("rate limited")
+            time.sleep(2)
+            bars, resolution = ls._fetch_history(tl, inst_id, os_["entry_time"], os_["exit_time"])
+            time.sleep(2)
             normalized = ls.normalize_bars(bars)
-            # filter bars inside position lifetime
             normalized["bar_close_time"] = normalized["time"] + pd.to_timedelta(
-                {"1m": 60, "5m": 300, "15m": 900}[resolution], unit="s"
+                {"1m": 60, "5m": 300, "15m": 900}.get(resolution, 60), unit="s"
             )
             in_life = normalized[
                 (normalized["time"] >= os_["entry_time"])
@@ -102,8 +127,9 @@ def run():
             pv = ls.usd_per_price_unit(alert.symbol)
             if alert.symbol.endswith('.R') and 'EUR' in alert.symbol:
                 pv *= 1.0
-            key = (str(alert.timestamp)[:19].replace('T',' '), alert.symbol)
-            sl_price = sl_lookup.get(key)
+
+            lk = (str(alert.timestamp)[:19].replace('T', ' '), alert.symbol)
+            sl_price = sl_lookup.get(lk)
             if sl_price is None:
                 risk_pts = 100.0 / (qty * pv) if (qty * pv) else 10
                 if entry_side == "buy":
@@ -139,11 +165,16 @@ def run():
                     "pnl": round(pnl, 2),
                     "be_triggered": be,
                     "locked": locked,
-                    "actual_pnl": round(os_.get("realized_pnl", 0), 2),
+                    "actual_pnl": round(os_.get("gross_pnl_price_units", 0) * pv, 2),
                 })
+
+            done_keys.add((alert.symbol, entry_time_str))
+            _save_cache("results.json", trades_out)
+            print(f"  done: {alert.symbol} {entry_time_str} ({len(trades_out)//4} trades total)")
         except Exception as e:
             missing += 1
-            print(f"  skip {alert.symbol}: {e}")
+            print(f"  skip {alert.symbol}: {str(e)[:80]}")
+            time.sleep(5)
 
     # Report
     for variant in brb.VARIANTS:
@@ -155,21 +186,20 @@ def run():
         exp = net / len(pnls) if pnls else 0
         be_count = sum(1 for t in subset if t["be_triggered"])
         lock_count = sum(1 for t in subset if t["locked"])
+        tp_count = sum(1 for t in subset if t["exit_reason"] == "tp")
+        sl_count = sum(1 for t in subset if t["exit_reason"] == "sl")
         print(f"\nVariant {variant}: n={len(subset)}, net=${net:.2f}, "
-              f"WR={wr:.1f}%, exp=${exp:.2f}, BE-triggered={be_count}, locked={lock_count}")
+              f"WR={wr:.1f}%, exp=${exp:.2f}, BE={be_count}, locked={lock_count}, TP={tp_count}, SL={sl_count}")
 
-    # Variant A reconciliation
     a_trades = [t for t in trades_out if t["variant"] == "A"]
     if a_trades:
         sim_net = sum(t["pnl"] for t in a_trades)
         actual_net = sum(t["actual_pnl"] for t in a_trades)
-        print(f"\nVariant A reconciliation: sim=${sim_net:.2f} vs actual=${actual_net:.2f}, "
-              f"gap=${sim_net-actual_net:.2f}")
+        print(f"\nVariant A reconciliation: sim=${sim_net:.2f} vs actual=${actual_net:.2f}, gap=${sim_net-actual_net:.2f}")
 
-    with open("/tmp/be_replay_full.json", "w") as f:
-        json.dump(trades_out, f, indent=2, default=str)
     print(f"\nTotal trades: {len(trades_out)//4}, missing: {missing}")
-    print("Results saved to /tmp/be_replay_full.json")
+    _save_cache("results.json", trades_out)
+    print("Results saved to cache")
 
 
 if __name__ == "__main__":
