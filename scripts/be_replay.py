@@ -176,7 +176,10 @@ def run():
             print(f"  skip {alert.symbol}: {str(e)[:80]}")
             time.sleep(5)
 
-    # Report
+    FOUR_PAIR = {"XAUUSD.R", "NAS100.R", "US30.R", "USDJPY.R"}
+
+    # Report - full window
+    print("\n=== FULL WINDOW ===")
     for variant in brb.VARIANTS:
         subset = [t for t in trades_out if t["variant"] == variant]
         pnls = [t["pnl"] for t in subset]
@@ -188,14 +191,63 @@ def run():
         lock_count = sum(1 for t in subset if t["locked"])
         tp_count = sum(1 for t in subset if t["exit_reason"] == "tp")
         sl_count = sum(1 for t in subset if t["exit_reason"] == "sl")
+        be_exit = sum(1 for t in subset if t["exit_reason"] == "be")
+        lock_exit = sum(1 for t in subset if t["exit_reason"] == "lock")
+        open_count = sum(1 for t in subset if t["exit_reason"] == "open")
+        avg_win = sum(p for p in pnls if p > 0) / wins if wins else 0
+        avg_loss = sum(p for p in pnls if p < 0) / max(1, sum(1 for p in pnls if p < 0))
         print(f"\nVariant {variant}: n={len(subset)}, net=${net:.2f}, "
-              f"WR={wr:.1f}%, exp=${exp:.2f}, BE={be_count}, locked={lock_count}, TP={tp_count}, SL={sl_count}")
+              f"WR={wr:.1f}% ({wins} wins), exp=${exp:.2f}/trade, "
+              f"avg_win=${avg_win:.2f}, avg_loss=${avg_loss:.2f}")
+        print(f"  BE-triggered={be_count}, locked={lock_count}, "
+              f"TP={tp_count}, SL={sl_count}, BE-exit={be_exit}, lock-exit={lock_exit}, open={open_count}")
 
+    # Per-symbol
+    print("\n=== PER SYMBOL (Variant A vs B) ===")
+    symbols = sorted(set(t["symbol"] for t in trades_out))
+    for sym in symbols:
+        a = [t for t in trades_out if t["variant"]=="A" and t["symbol"]==sym]
+        b = [t for t in trades_out if t["variant"]=="B" and t["symbol"]==sym]
+        if not a: continue
+        a_net = sum(t["pnl"] for t in a)
+        b_net = sum(t["pnl"] for t in b)
+        print(f"  {sym}: n={len(a)}, A=${a_net:.2f}, B=${b_net:.2f}, delta=${a_net-b_net:.2f}")
+
+    # Per-week
+    print("\n=== PER WEEK (Variant A vs B) ===")
+    weeks = sorted(set(t["week"] for t in trades_out))
+    for wk in weeks:
+        a = [t for t in trades_out if t["variant"]=="A" and t["week"]==wk]
+        b = [t for t in trades_out if t["variant"]=="B" and t["week"]==wk]
+        if not a: continue
+        a_net = sum(t["pnl"] for t in a)
+        b_net = sum(t["pnl"] for t in b)
+        print(f"  {wk}: n={len(a)}, A=${a_net:.2f}, B=${b_net:.2f}, delta=${a_net-b_net:.2f}")
+
+    # Four-pair subset
+    print("\n=== FOUR-PAIR SUBSET (XAU, NAS, US30, USDJPY) ===")
+    for variant in brb.VARIANTS:
+        subset = [t for t in trades_out if t["variant"]==variant and t["symbol"] in FOUR_PAIR]
+        pnls = [t["pnl"] for t in subset]
+        net = sum(pnls)
+        wins = sum(1 for p in pnls if p > 0)
+        wr = wins/len(pnls)*100 if pnls else 0
+        exp = net/len(pnls) if pnls else 0
+        print(f"  Variant {variant}: n={len(subset)}, net=${net:.2f}, WR={wr:.1f}%, exp=${exp:.2f}")
+
+    # Reconciliation
     a_trades = [t for t in trades_out if t["variant"] == "A"]
     if a_trades:
         sim_net = sum(t["pnl"] for t in a_trades)
         actual_net = sum(t["actual_pnl"] for t in a_trades)
         print(f"\nVariant A reconciliation: sim=${sim_net:.2f} vs actual=${actual_net:.2f}, gap=${sim_net-actual_net:.2f}")
+
+    # BE bought-vs-cost
+    a_exits = [t for t in trades_out if t["variant"]=="A"]
+    be_scratches = sum(1 for t in a_exits if t["exit_reason"]=="be")
+    locks = sum(1 for t in a_exits if t["locked"])
+    print(f"\nBE bought: {be_scratches} BE-scratches (would be full stops under B)")
+    print(f"BE cost: {locks} locks (+$50) that might have run to TP under B")
 
     print(f"\nTotal trades: {len(trades_out)//4}, missing: {missing}")
     _save_cache("results.json", trades_out)
