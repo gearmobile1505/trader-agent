@@ -1,6 +1,6 @@
 {
-  "scan_time_et": "2026-11-06T12:00",
-  "scan_time_utc": "2026-11-06T17:00:06Z",
+  "scan_time_et": "2026-11-06T12:30",
+  "scan_time_utc": "2026-11-06T17:30:05Z",
   "universe_size": 18,
   "data_source": "TradeLocker API (GATESFX demo) - broker feed",
   "instrument_mapping": {
@@ -81,12 +81,12 @@
     "EURUSD": {
       "api_name": "EURUSD.R",
       "instrument_id": 13439,
-      "spread": 5e-05,
+      "spread": 1e-05,
       "30m": {
         "status": "ok",
         "tier": "trending_down",
         "direction": "down",
-        "last_close": 1.11533,
+        "last_close": 1.11482,
         "n_candles": 1053,
         "swing_highs": [
           {
@@ -117,13 +117,13 @@
           }
         ],
         "trend_start_utc": "2026-11-06T05:30:00Z",
-        "candles_since_trend_start": 23,
+        "candles_since_trend_start": 24,
         "key_level": {
           "side": "swing_high",
           "price": 1.11927,
           "time_utc": "2026-11-06T08:30:00Z"
         },
-        "distance_pct": -0.352,
+        "distance_pct": -0.398,
         "candle_depth": 1053
       },
       "1h": {
@@ -174,12 +174,12 @@
     "GBPUSD": {
       "api_name": "GBPUSD.R",
       "instrument_id": 13443,
-      "spread": 6e-05,
+      "spread": 3e-05,
       "30m": {
         "status": "ok",
         "tier": "very_clear_down",
         "direction": "down",
-        "last_close": 1.33699,
+        "last_close": 1.33665,
         "n_candles": 1053,
         "swing_highs": [
           {
@@ -210,13 +210,13 @@
           }
         ],
         "trend_start_utc": "2026-11-04T11:00:00Z",
-        "candles_since_trend_start": 108,
+        "candles_since_trend_start": 109,
         "key_level": {
           "side": "swing_high",
           "price": 1.34042,
           "time_utc": "2026-11-06T12:00:00Z"
         },
-        "distance_pct": -0.256,
+        "distance_pct": -0.281,
         "candle_depth": 1053
       },
       "1h": {
@@ -267,12 +267,12 @@
     "USDJPY": {
       "api_name": "USDJPY.R",
       "instrument_id": 13440,
-      "spread": 0.001,
+      "spread": 0.0,
       "30m": {
         "status": "ok",
-        "tier": "no_clear_trend",
-        "direction": null,
-        "last_close": 158.228,
+        "tier": "trending_up",
+        "direction": "up",
+        "last_close": 158.241,
         "n_candles": 1053,
         "swing_highs": [
           {
@@ -290,22 +290,26 @@
         ],
         "swing_lows": [
           {
-            "price": 157.255,
-            "time_utc": "2026-11-05T23:00:00Z"
-          },
-          {
             "price": 157.729,
             "time_utc": "2026-11-06T03:30:00Z"
           },
           {
             "price": 157.69,
             "time_utc": "2026-11-06T07:30:00Z"
+          },
+          {
+            "price": 158.105,
+            "time_utc": "2026-11-06T15:30:00Z"
           }
         ],
-        "trend_start_utc": null,
-        "candles_since_trend_start": null,
-        "key_level": null,
-        "distance_pct": null,
+        "trend_start_utc": "2026-11-06T07:30:00Z",
+        "candles_since_trend_start": 20,
+        "key_level": {
+          "side": "swing_low",
+          "price": 158.105,
+          "time_utc": "2026-11-06T15:30:00Z"
+        },
+        "distance_pct": 0.086,
         "candle_depth": 1053
       },
       "1h": {
@@ -356,12 +360,12 @@
     "USDCHF": {
       "api_name": "USDCHF.R",
       "instrument_id": 13445,
-      "spread": 4e-05,
+      "spread": 3e-05,
       "30m": {
         "status": "ok",
         "tier": "very_clear_up",
         "direction": "up",
-        "last_close": 0.81917,
+        "last_close": 0.81974,
         "n_candles": 1053,
         "swing_highs": [
           {
@@ -392,13 +396,13 @@
           }
         ],
         "trend_start_utc": "2026-11-05T07:00:00Z",
-        "candles_since_trend_start": 68,
+        "candles_since_trend_start": 69,
         "key_level": {
           "side": "swing_low",
           "price": 0.81769,
           "time_utc": "2026-11-06T11:00:00Z"
         },
-        "distance_pct": 0.181,
+        "distance_pct": 0.251,
         "candle_depth": 1053
       },
       "1h": {
@@ -449,12 +453,12 @@
     "AUDUSD": {
       "api_name": "AUDUSD.R",
       "instrument_id": 13444,
-      "spread": 1e-05,
+      "spread": 0.0,
       "30m": {
         "status": "ok",
         "tier": "very_clear_down",
         "direction": "down",
-        "last_close": 0.68737,
+        "last_close": 0.6868,
         "n_candles": 1053,
         "swing_highs": [
           {
@@ -485,13 +489,13 @@
           }
         ],
         "trend_start_utc": "2026-11-05T02:30:00Z",
-        "candles_since_trend_start": 77,
+        "candles_since_trend_start": 78,
         "key_level": {
           "side": "swing_high",
           "price": 0.68932,
           "time_utc": "2026-11-06T15:00:00Z"
         },
-        "distance_pct": -0.283,
+        "distance_pct": -0.366,
         "candle_depth": 1053
       },
       "1h": {
@@ -542,12 +546,12 @@
     "USDCAD": {
       "api_name": "USDCAD.R",
       "instrument_id": 13442,
-      "spread": 0.00011,
+      "spread": 4e-05,
       "30m": {
         "status": "ok",
         "tier": "trending_up",
         "direction": "up",
-        "last_close": 1.41068,
+        "last_close": 1.41155,
         "n_candles": 1053,
         "swing_highs": [
           {
@@ -578,13 +582,13 @@
           }
         ],
         "trend_start_utc": "2026-11-05T22:00:00Z",
-        "candles_since_trend_start": 38,
+        "candles_since_trend_start": 39,
         "key_level": {
           "side": "swing_low",
           "price": 1.40521,
           "time_utc": "2026-11-06T12:00:00Z"
         },
-        "distance_pct": 0.389,
+        "distance_pct": 0.451,
         "candle_depth": 1053
       },
       "1h": {
@@ -635,12 +639,12 @@
     "NZDUSD": {
       "api_name": "NZDUSD.R",
       "instrument_id": 13441,
-      "spread": 2e-05,
+      "spread": 3e-05,
       "30m": {
         "status": "ok",
         "tier": "very_clear_down",
         "direction": "down",
-        "last_close": 0.55485,
+        "last_close": 0.55474,
         "n_candles": 1053,
         "swing_highs": [
           {
@@ -671,13 +675,13 @@
           }
         ],
         "trend_start_utc": "2026-11-04T22:30:00Z",
-        "candles_since_trend_start": 85,
+        "candles_since_trend_start": 86,
         "key_level": {
           "side": "swing_high",
           "price": 0.55555,
           "time_utc": "2026-11-06T15:00:00Z"
         },
-        "distance_pct": -0.126,
+        "distance_pct": -0.146,
         "candle_depth": 1053
       },
       "1h": {
@@ -724,12 +728,12 @@
     "GBPJPY.R": {
       "api_name": "GBPJPY.R",
       "instrument_id": 13452,
-      "spread": 0.007,
+      "spread": 0.006,
       "30m": {
         "status": "ok",
         "tier": "no_clear_trend",
         "direction": null,
-        "last_close": 211.549,
+        "last_close": 211.515,
         "n_candles": 1053,
         "swing_highs": [
           {
@@ -818,7 +822,7 @@
         "status": "ok",
         "tier": "trending_up",
         "direction": "up",
-        "last_close": 176.481,
+        "last_close": 176.414,
         "n_candles": 1053,
         "swing_highs": [
           {
@@ -849,13 +853,13 @@
           }
         ],
         "trend_start_utc": "2026-11-06T06:30:00Z",
-        "candles_since_trend_start": 21,
+        "candles_since_trend_start": 22,
         "key_level": {
           "side": "swing_low",
           "price": 176.324,
           "time_utc": "2026-11-06T14:00:00Z"
         },
-        "distance_pct": 0.089,
+        "distance_pct": 0.051,
         "candle_depth": 1053
       },
       "1h": {
@@ -906,12 +910,12 @@
     "EURGBP": {
       "api_name": "EURGBP.R",
       "instrument_id": 13450,
-      "spread": 1e-05,
+      "spread": 2e-05,
       "30m": {
         "status": "ok",
         "tier": "trending_up",
         "direction": "up",
-        "last_close": 0.83421,
+        "last_close": 0.83402,
         "n_candles": 1053,
         "swing_highs": [
           {
@@ -942,13 +946,13 @@
           }
         ],
         "trend_start_utc": "2026-11-06T06:30:00Z",
-        "candles_since_trend_start": 21,
+        "candles_since_trend_start": 22,
         "key_level": {
           "side": "swing_low",
           "price": 0.83339,
           "time_utc": "2026-11-06T13:30:00Z"
         },
-        "distance_pct": 0.098,
+        "distance_pct": 0.076,
         "candle_depth": 1053
       },
       "1h": {
@@ -999,12 +1003,12 @@
     "AUDJPY": {
       "api_name": "AUDJPY.R",
       "instrument_id": 13465,
-      "spread": 0.006,
+      "spread": 0.008,
       "30m": {
         "status": "ok",
         "tier": "very_clear_down",
         "direction": "down",
-        "last_close": 108.762,
+        "last_close": 108.683,
         "n_candles": 1053,
         "swing_highs": [
           {
@@ -1035,13 +1039,13 @@
           }
         ],
         "trend_start_utc": "2026-11-05T00:30:00Z",
-        "candles_since_trend_start": 81,
+        "candles_since_trend_start": 82,
         "key_level": {
           "side": "swing_high",
           "price": 109.159,
           "time_utc": "2026-11-06T14:30:00Z"
         },
-        "distance_pct": -0.364,
+        "distance_pct": -0.436,
         "candle_depth": 1053
       },
       "1h": {
@@ -1092,12 +1096,12 @@
     "XAUUSD.R": {
       "api_name": "XAUUSD.R",
       "instrument_id": 13676,
-      "spread": -0.1,
+      "spread": 0.37,
       "30m": {
         "status": "ok",
         "tier": "very_clear_down",
         "direction": "down",
-        "last_close": 4067.01,
+        "last_close": 4060.06,
         "n_candles": 1034,
         "swing_highs": [
           {
@@ -1128,13 +1132,13 @@
           }
         ],
         "trend_start_utc": "2026-11-05T15:30:00Z",
-        "candles_since_trend_start": 51,
+        "candles_since_trend_start": 52,
         "key_level": {
           "side": "swing_high",
           "price": 4073.28,
           "time_utc": "2026-11-06T11:30:00Z"
         },
-        "distance_pct": -0.154,
+        "distance_pct": -0.325,
         "candle_depth": 1034
       },
       "1h": {
@@ -1185,12 +1189,12 @@
     "XPDUSD.R": {
       "api_name": "XPDUSD.R",
       "instrument_id": 13674,
-      "spread": 0.95,
+      "spread": 1.26,
       "30m": {
         "status": "ok",
         "tier": "no_clear_trend",
         "direction": null,
-        "last_close": 1021.65,
+        "last_close": 1020.21,
         "n_candles": 1029,
         "swing_highs": [
           {
@@ -1274,12 +1278,12 @@
     "XAGUSD.R": {
       "api_name": "XAGUSD.R",
       "instrument_id": 13673,
-      "spread": 0.035,
+      "spread": 0.033,
       "30m": {
         "status": "ok",
         "tier": "no_clear_trend",
         "direction": null,
-        "last_close": 52.072,
+        "last_close": 51.902,
         "n_candles": 1027,
         "swing_highs": [
           {
@@ -1359,18 +1363,14 @@
     "US30.R": {
       "api_name": "US30.R",
       "instrument_id": 13638,
-      "spread": 2.68,
+      "spread": -0.8,
       "30m": {
         "status": "ok",
         "tier": "no_clear_trend",
         "direction": null,
-        "last_close": 51601.23,
+        "last_close": 51531.9,
         "n_candles": 1028,
         "swing_highs": [
-          {
-            "price": 51866.9,
-            "time_utc": "2026-11-05T19:30:00Z"
-          },
           {
             "price": 51455.9,
             "time_utc": "2026-11-06T00:30:00Z"
@@ -1378,6 +1378,10 @@
           {
             "price": 51239.96,
             "time_utc": "2026-11-06T09:30:00Z"
+          },
+          {
+            "price": 51642.47,
+            "time_utc": "2026-11-06T15:30:00Z"
           }
         ],
         "swing_lows": [
@@ -1444,12 +1448,12 @@
     "NAS100.R": {
       "api_name": "NAS100.R",
       "instrument_id": 13645,
-      "spread": 1.86,
+      "spread": 0.77,
       "30m": {
         "status": "ok",
         "tier": "no_clear_trend",
         "direction": null,
-        "last_close": 27145.57,
+        "last_close": 27102.17,
         "n_candles": 1029,
         "swing_highs": [
           {
@@ -1533,12 +1537,12 @@
     "SPX500.R": {
       "api_name": "SPX500.R",
       "instrument_id": 13644,
-      "spread": 0.7,
+      "spread": 1.07,
       "30m": {
         "status": "ok",
         "tier": "trending_up",
         "direction": "up",
-        "last_close": 7423.45,
+        "last_close": 7413.44,
         "n_candles": 1028,
         "swing_highs": [
           {
@@ -1569,13 +1573,13 @@
           }
         ],
         "trend_start_utc": "2026-11-06T07:30:00Z",
-        "candles_since_trend_start": 19,
+        "candles_since_trend_start": 20,
         "key_level": {
           "side": "swing_low",
           "price": 7350.09,
           "time_utc": "2026-11-06T13:30:00Z"
         },
-        "distance_pct": 0.998,
+        "distance_pct": 0.862,
         "candle_depth": 1028
       },
       "1h": {
@@ -1626,12 +1630,12 @@
     "UKOIL.R": {
       "api_name": "UKOIL.R",
       "instrument_id": 13119,
-      "spread": 0.031,
+      "spread": 0.05,
       "30m": {
         "status": "ok",
         "tier": "no_clear_trend",
         "direction": null,
-        "last_close": 96.276,
+        "last_close": 96.532,
         "n_candles": 960,
         "swing_highs": [
           {
