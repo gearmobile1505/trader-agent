@@ -2037,6 +2037,13 @@ async def check_and_apply_trailing_stops(positions_df=None):
             unrealized_pl = float(pos.get("unrealizedPl", 0.0))
             avg_price = float(pos.get("avgPrice", 0.0))
             instrument_id = int(pos.get("tradableInstrumentId", 0))
+
+            tl_symbol = resolve_symbol_for_instrument(instrument_id)
+            if tl_symbol is None:
+                print(f"[BE SL] Position {position_id}: instrument {instrument_id} is not in "
+                      f"the configured symbol list — leaving stop untouched", flush=True)
+                continue
+
             stage = max(
                 trailing_stop_stage(unrealized_pl),
                 _trailing_stop_stages.get(position_id, 0),
